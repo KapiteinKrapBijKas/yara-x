@@ -23,6 +23,18 @@ def test_relaxed_re_syntax():
   assert len(matching_rules) == 1
 
 
+def test_error_on_slow_pattern():
+  compiler = yara_x.Compiler(error_on_slow_pattern=True)
+  with pytest.raises(yara_x.CompileError):
+    compiler.add_source(r'rule test {strings: $a = /a.*/ condition: $a}')
+
+
+def test_invalid_rule_name_regexp():
+  compiler = yara_x.Compiler()
+  with pytest.raises(ValueError):
+    compiler.rule_name_regexp("(AXS|ERS")
+
+
 def test_int_globals():
   compiler = yara_x.Compiler()
   compiler.define_global('some_int', 1)
@@ -111,7 +123,7 @@ def test_namespaces():
 
 
 def test_metadata():
-	rules = yara_x.compile('''
+  rules = yara_x.compile('''
 	rule test {
 		meta:
 			foo = 1
@@ -124,17 +136,30 @@ def test_metadata():
 	}
 	''')
 
-	matching_rules = rules.scan(b'').matching_rules
-	
-	assert matching_rules[0].metadata == (
-		("foo", 1), 
-		("bar", 2.0), 
-		("baz", True), 
-		("qux", "qux"), 
-		("quux", "qu\0x")
-	)
-	
-	
+  matching_rules = rules.scan(b'').matching_rules
+
+  assert matching_rules[0].metadata == (
+      ("foo", 1),
+      ("bar", 2.0),
+      ("baz", True),
+      ("qux", "qux"),
+      ("quux", "qu\0x")
+  )
+
+
+def test_tags():
+  rules = yara_x.compile('''
+	rule test : tag1 tag2 {
+		condition:
+		  true	
+	}
+	''')
+
+  matching_rules = rules.scan(b'').matching_rules
+
+  assert matching_rules[0].tags == ("tag1", "tag2")
+
+
 def test_compile_and_scan():
   rules = yara_x.compile('rule foo {strings: $a = "foo" condition: $a}')
   matching_rules = rules.scan(b'foobar').matching_rules
@@ -170,7 +195,7 @@ def test_xor_key():
 def test_scanner_timeout():
   compiler = yara_x.Compiler()
   compiler.add_source(
-      'rule foo {condition: for all i in (0..10000000000) : ( true )}')
+      'rule foo {condition: for all i in (0..100000000000) : ( true )}')
   scanner = yara_x.Scanner(compiler.build())
   scanner.set_timeout(1)
   with pytest.raises(yara_x.TimeoutError):
@@ -201,6 +226,39 @@ def test_serialization():
   assert len(rules.scan(b'').matching_rules) == 1
 
 
+def tests_compiler_errors():
+  compiler = yara_x.Compiler()
+
+  with pytest.raises(yara_x.CompileError):
+    compiler.add_source('rule foo { condition: bar }')
+
+  errors = compiler.errors()
+
+  assert len(errors) == 1
+  assert errors[0]['type'] == "UnknownIdentifier"
+  assert errors[0]['code'] == "E009"
+  assert errors[0]['title'] == "unknown identifier `bar`"
+
+
+def tests_compiler_warnings():
+  compiler = yara_x.Compiler()
+
+  compiler.add_source(
+      'rule test { strings: $a = {01 [0-1][0-1] 02 } condition: $a }')
+
+  warnings = compiler.warnings()
+
+  assert len(warnings) == 2
+
+  assert warnings[0]['type'] == "ConsecutiveJumps"
+  assert warnings[0]['code'] == "consecutive_jumps"
+  assert warnings[0]['title'] == "consecutive jumps in hex pattern `$a`"
+
+  assert warnings[1]['type'] == "SlowPattern"
+  assert warnings[1]['code'] == "slow_pattern"
+  assert warnings[1]['title'] == "slow pattern"
+
+
 def test_console_log():
   ok = False
 
@@ -216,3 +274,23 @@ def test_console_log():
   scanner.console_log(callback)
   scanner.scan(b'')
   assert ok
+
+
+def test_format():
+  import io
+  expected_output = (
+      '''rule test {
+  strings:
+    $a = "foo"
+
+  condition:
+    $a at 0
+}
+''')
+  inp = io.StringIO(
+      'rule test { strings: $a = "foo" condition: $a at 0 }')
+  output = io.StringIO()
+  fmt = yara_x.Formatter()
+  fmt.format(inp, output)
+  result = output.getvalue()
+  assert result == expected_output

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::cmp::min;
 use std::ffi::CStr;
 use std::fmt::{Display, Formatter, Write};
 use std::str::from_utf8;
@@ -33,7 +34,7 @@ pub enum Error<'a> {
     OutputWrite(std::fmt::Error),
 }
 
-impl<'a> From<std::fmt::Error> for Error<'a> {
+impl From<std::fmt::Error> for Error<'_> {
     fn from(value: std::fmt::Error) -> Self {
         Self::OutputWrite(value)
     }
@@ -257,7 +258,7 @@ impl<'a> Dotnet<'a> {
 
 impl<'a> Dotnet<'a> {
     const MAX_PARAMS: u32 = 1000;
-    const MAX_ROWS_PER_TABLE: u32 = 10000;
+    const MAX_ROWS_PER_TABLE: usize = 15000;
     const MAX_ARRAY_DIMENSION: u32 = 50;
     const MAX_RECURSION: usize = 16;
 
@@ -431,7 +432,7 @@ impl<'a> Dotnet<'a> {
         &mut self,
         input: &'a [u8],
     ) -> IResult<&'a [u8], ()> {
-        // The `#~` starts with a header that is followed the tables.
+        // The `#~` starts with a header that is followed by the tables.
         let (remainder, (_, _, _, heap_sizes, _, valid, _sorted)) =
             tuple((
                 le_u32, // reserved, always 0
@@ -448,15 +449,9 @@ impl<'a> Dotnet<'a> {
         let num_tables = u64::count_ones(valid);
 
         // Then follows an array of `num_tables` items with the number of rows
-        // per each table that is present. Limit the number of rows per table
-        // to a reasonable number of MAX_ROWS_PER_TABLE.
+        // per each table that is present.
         let (mut remainder, num_rows_per_present_table) = count(
-            map(
-                verify(le_u32, |num_rows| {
-                    *num_rows <= Self::MAX_ROWS_PER_TABLE
-                }),
-                |v| v as usize,
-            ),
+            map(le_u32, |v| v as usize),
             num_tables as usize,
         )(remainder)?;
 
@@ -471,7 +466,13 @@ impl<'a> Dotnet<'a> {
 
         for i in 0..64 {
             if valid & (1 << i) != 0 {
-                self.num_rows.push(num_rows_per_present_table.next().unwrap());
+                // Limit the number of rows per table to a reasonable number
+                // of MAX_ROWS_PER_TABLE.
+                let num_rows = min(
+                    num_rows_per_present_table.next().unwrap(),
+                    Self::MAX_ROWS_PER_TABLE,
+                );
+                self.num_rows.push(num_rows);
             } else {
                 self.num_rows.push(0)
             }
@@ -802,8 +803,8 @@ impl<'a> Dotnet<'a> {
                 })
                 .collect();
 
-            // The methods belonging to this type in in the MethodDef table
-            // go from the index specified by `method_list` to the index specified
+            // The methods belonging to this type in the MethodDef table go
+            // from the index specified by `method_list` to the index specified
             // by the next type's `method_list`. If this is the last type, then
             // it goes to the end of the MethodDef table.
             let method_defs =
@@ -1481,7 +1482,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.38
     fn parse_type_ref_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], TypeRef> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], TypeRef<'a>> + '_ {
         map(
             tuple((
                 // resolution scope
@@ -1508,7 +1509,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.37.
     fn parse_type_def_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], TypeDef> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], TypeDef<'a>> + '_ {
         map(
             tuple((
                 // flags
@@ -1573,7 +1574,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.26.
     fn parse_method_def_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], MethodDef> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], MethodDef<'a>> + '_ {
         map(
             tuple((
                 // rva
@@ -1660,7 +1661,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.9.
     fn parse_constant_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Constant> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Constant<'a>> + '_ {
         map(
             tuple((
                 map_opt(u8, num_traits::FromPrimitive::from_u8), // type
@@ -1681,7 +1682,8 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.10.
     fn parse_custom_attribute_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], CustomAttribute> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], CustomAttribute<'a>> + '_
+    {
         map(
             tuple((
                 // parent
@@ -1897,7 +1899,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.2.
     fn parse_assembly_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Assembly> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Assembly<'a>> + '_ {
         map(
             tuple((
                 le_u32,                                                   // hash_alg
@@ -1950,7 +1952,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.5.
     fn parse_assembly_ref_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], AssemblyRef> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], AssemblyRef<'a>> + '_ {
         map(
             tuple((
                 le_u16, // major_version
@@ -2146,7 +2148,7 @@ impl<'a> Dotnet<'a> {
     /// ECMA-335 Section II.22.20.
     fn parse_generic_param_row(
         &self,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], GenericParam> + '_ {
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], GenericParam<'a>> + '_ {
         map(
             tuple((
                 le_u16, // number

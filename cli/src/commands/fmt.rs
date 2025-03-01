@@ -1,50 +1,69 @@
-use std::fs;
 use std::fs::File;
-use std::io::{stdin, stdout, Cursor, Seek, Write};
+use std::io::{Cursor, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::{fs, io, process};
 
 use clap::{arg, value_parser, ArgAction, ArgMatches, Command};
 use yara_x_fmt::Formatter;
 
+use crate::config::FormatConfig;
+use crate::help::FMT_CHECK_MODE;
+
 pub fn fmt() -> Command {
-    super::command("fmt").about("Format YARA source files")
-        // The `fmt` command is not ready yet.
-        .hide(true)
+    super::command("fmt")
+        .about("Format YARA source files")
         .arg(
             arg!(<FILE>)
-            .help("Path to YARA source file")
-            .value_parser(value_parser!(PathBuf))
-            .action(ArgAction::Append),
+                .help("Path to YARA source file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Append),
         )
-        .arg(
-            arg!(-w  --write ... "Write output to source file instead of stdout")
-                .action(ArgAction::SetTrue),
-        )
+        .arg(arg!(-c --check  "Run in 'check' mode").long_help(FMT_CHECK_MODE))
 }
 
-pub fn exec_fmt(args: &ArgMatches) -> anyhow::Result<()> {
-    let files = args.get_many::<PathBuf>("FILE");
-    let write = args.get_one::<bool>("write");
+pub fn exec_fmt(
+    args: &ArgMatches,
+    config: FormatConfig,
+) -> anyhow::Result<()> {
+    let files = args.get_many::<PathBuf>("FILE").unwrap();
+    let check = args.get_flag("check");
 
-    let formatter = Formatter::new();
+    let formatter = Formatter::new()
+        .align_metadata(config.meta.align_values)
+        .align_patterns(config.patterns.align_values)
+        .indent_section_headers(config.rule.indent_section_headers)
+        .indent_section_contents(config.rule.indent_section_contents)
+        .indent_spaces(config.rule.indent_spaces)
+        .newline_before_curly_brace(config.rule.newline_before_curly_brace)
+        .empty_line_before_section_header(
+            config.rule.empty_line_before_section_header,
+        )
+        .empty_line_after_section_header(
+            config.rule.empty_line_after_section_header,
+        );
 
-    if let Some(files) = files {
-        for file in files {
-            let input = fs::read(file.as_path())?;
-            if *write.unwrap() {
-                let mut formatted = Cursor::new(Vec::new());
+    let mut modified = false;
 
-                formatter.format(input.as_slice(), &mut formatted)?;
-                formatted.rewind()?;
-
-                File::create(file.as_path())?
-                    .write_all(formatted.into_inner().as_slice())?;
+    for file in files {
+        let input = fs::read(file.as_path())?;
+        modified = if check {
+            formatter.format(input.as_slice(), io::sink())?
+        } else {
+            let mut formatted = Cursor::new(Vec::with_capacity(input.len()));
+            if formatter.format(input.as_slice(), &mut formatted)? {
+                formatted.seek(SeekFrom::Start(0))?;
+                let mut output_file = File::create(file.as_path())?;
+                io::copy(&mut formatted, &mut output_file)?;
+                true
             } else {
-                formatter.format(input.as_slice(), stdout())?;
-            };
-        }
-    } else {
-        formatter.format(stdin(), stdout())?;
+                false
+            }
+        } || modified;
+    }
+
+    if modified {
+        process::exit(1)
     }
 
     Ok(())

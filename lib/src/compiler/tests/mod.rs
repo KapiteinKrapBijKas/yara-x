@@ -1,15 +1,14 @@
-use pretty_assertions::assert_eq;
-use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::mem::size_of;
-use yara_x_parser::Parser;
 
-use crate::compiler::{
-    SerializationError, SubPattern, Var, VarStack, VariableError,
-};
+use pretty_assertions::assert_eq;
+use serde_json::json;
+
+use crate::compiler::{linters, SubPattern, VarStack};
+use crate::errors::{SerializationError, VariableError};
 use crate::types::Type;
-use crate::{compile, Compiler, Error, Rules, Scanner};
+use crate::{compile, Compiler, Rules, Scanner, SourceCode};
 
 #[test]
 fn serialization() {
@@ -65,6 +64,18 @@ fn namespaces() {
         .new_namespace("bar")
         .add_source("rule bar {condition: foo}")
         .is_err());
+
+    let mut compiler = Compiler::new();
+
+    // `bar` can use `foo` because they are in the same namespace, the second
+    // call to `new_namespace` has no effect.
+    assert!(compiler
+        .new_namespace("foo")
+        .add_source("rule foo {condition: true}")
+        .unwrap()
+        .new_namespace("foo")
+        .add_source("rule bar {condition: foo}")
+        .is_ok());
 }
 
 #[test]
@@ -74,31 +85,35 @@ fn var_stack() {
     let mut frame1 = stack.new_frame(4);
     let mut frame2 = stack.new_frame(4);
 
-    assert_eq!(
-        frame1.new_var(Type::Integer),
-        Var { ty: Type::Integer, index: 0 }
-    );
+    let var = frame1.new_var(Type::Integer);
 
-    assert_eq!(
-        frame1.new_var(Type::String),
-        Var { ty: Type::String, index: 1 }
-    );
+    assert_eq!(var.ty(), Type::Integer);
+    assert_eq!(var.frame_id(), 1);
+    assert_eq!(var.index(), 0);
 
-    // The first variable in the frame goes after the first two variables
-    // already allocated in the stack.
-    assert_eq!(
-        frame2.new_var(Type::Integer),
-        Var { ty: Type::Integer, index: 4 }
-    );
+    let var = frame1.new_var(Type::String);
 
-    assert_eq!(
-        frame2.new_var(Type::Integer),
-        Var { ty: Type::Integer, index: 5 }
-    );
+    assert_eq!(var.ty(), Type::String);
+    assert_eq!(var.frame_id(), 1);
+    assert_eq!(var.index(), 1);
+
+    // The first variable in the second frame goes after the first two
+    // variables already allocated in the stack.
+    let var = frame2.new_var(Type::Integer);
+
+    assert_eq!(var.ty(), Type::Integer);
+    assert_eq!(var.frame_id(), 2);
+    assert_eq!(var.index(), 4);
+
+    let var = frame2.new_var(Type::Bool);
+
+    assert_eq!(var.ty(), Type::Bool);
+    assert_eq!(var.frame_id(), 2);
+    assert_eq!(var.index(), 5);
 
     stack.unwind(&frame1);
 
-    assert_eq!(stack.used, 0);
+    assert_eq!(stack.used(), 0);
 }
 
 #[test]
@@ -123,9 +138,7 @@ fn globals() {
 
     assert_eq!(
         compiler.define_global("#invalid", true).err().unwrap(),
-        Error::VariableError(VariableError::InvalidIdentifier(
-            "#invalid".to_string()
-        ))
+        VariableError::InvalidIdentifier("#invalid".to_string())
     );
 
     let mut compiler = Compiler::new();
@@ -137,7 +150,7 @@ fn globals() {
             .define_global("a", false)
             .err()
             .unwrap(),
-        Error::VariableError(VariableError::AlreadyExists("a".to_string()))
+        VariableError::AlreadyExists("a".to_string())
     );
 
     let mut compiler = Compiler::new();
@@ -374,7 +387,7 @@ fn globals() {
         .new_namespace("test")
         .add_source(
             r#"
-            rule foo {strings: $a = "foo" condition: $a} 
+            rule foo {strings: $a = "foo" condition: $a}
             global rule always_true { condition: true }"#,
         )
         .unwrap();
@@ -401,7 +414,7 @@ fn globals() {
                 r#"
             import "test_proto2"
             rule foo {
-                condition: 
+                condition:
                     str_foo == "foo" and
                     for any s in test_proto2.array_string: (s == str_foo)
              }"#,
@@ -440,7 +453,7 @@ fn globals_json() {
         .add_source(
             r#"
             rule foo {
-            condition: 
+            condition:
                 some_struct.some_int == 1 and
                 some_struct.some_bool and
                 some_struct.some_string == "foo" and
@@ -465,28 +478,28 @@ fn globals_json() {
         Compiler::new()
             .define_global("invalid_array", json!([1, "foo", 3]))
             .unwrap_err(),
-        Error::VariableError(VariableError::InvalidArray)
+        VariableError::InvalidArray
     );
 
     assert_eq!(
         Compiler::new()
             .define_global("invalid_array", json!([1, [2, 3], 4]))
             .unwrap_err(),
-        Error::VariableError(VariableError::InvalidArray)
+        VariableError::InvalidArray
     );
 
     assert_eq!(
         Compiler::new()
             .define_global("invalid_array", json!([1, null]))
             .unwrap_err(),
-        Error::VariableError(VariableError::InvalidArray)
+        VariableError::InvalidArray
     );
 
     assert_eq!(
         Compiler::new()
             .define_global("invalid_array", json!({ "foo": null }))
             .unwrap_err(),
-        Error::VariableError(VariableError::UnexpectedNull)
+        VariableError::UnexpectedNull
     );
 }
 
@@ -542,8 +555,19 @@ fn unsupported_modules() {
         .add_source(
             r#"
             import "foo_module"
-            rule ignored { condition: foo_module.some_field == 1 }
-            // This rule should match even if the previous one was ignored.
+
+            // This rule is ignored because it uses an ignored module.
+            rule ignored_1 { condition: foo_module.some_field == 1 }
+
+            // This rule is ignored because it depends on a rule that directly
+            // depends on an ignored moduled.
+            rule ignored_2 { condition: ignored_1 }
+
+            // This rule is ignored because it depends on a rule that indirectly
+            // depends on an ignored module.
+            rule ignored_3 { condition: ignored_2 }
+
+            // This rule should match even if the previous ones were ignored.
             rule always_true { condition: true }
             "#,
         )
@@ -563,18 +587,265 @@ fn unsupported_modules() {
 
 #[cfg(feature = "test_proto2-module")]
 #[test]
+fn banned_modules() {
+    let mut compiler = Compiler::new();
+
+    assert_eq!(
+        compiler
+            .ban_module(
+                "test_proto2",
+                "module `test_proto2` can't be used",
+                "module `test_proto2` is used here",
+            )
+            .add_source(
+                r#"
+            import "test_proto2"
+            rule test { condition: test_proto2.int32_zero == 0}
+            "#,
+            )
+            .expect_err("expected error")
+            .to_string(),
+        r#"error[E100]: module `test_proto2` can't be used
+ --> line:2:13
+  |
+2 |             import "test_proto2"
+  |             ^^^^^^^^^^^^^^^^^^^^ module `test_proto2` is used here
+  |"#
+    );
+
+    // The only error should be the error about the use of a banned module,
+    // the condition `test_proto2.int32_zero == 0` should not produce any
+    // error.
+    assert_eq!(compiler.errors().len(), 1);
+}
+
+#[test]
+fn linter_tag_list() {
+    assert!(Compiler::new()
+        .add_linter(linters::tags_allowed(vec![
+            "foo".to_string(),
+            "bar".to_string()
+        ]))
+        .add_source(
+            r#"rule test : foo bar { strings: $foo = "foo" condition: $foo }"#
+        )
+        .unwrap()
+        .warnings()
+        .is_empty());
+
+    // This linter should return multiple warnings.
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::tags_allowed(vec![
+                "foo".to_string(),
+                "bar".to_string(),
+            ]))
+            .add_source(
+                r#"rule test : axs ers { strings: $foo = "foo" condition: $foo }"#
+            )
+            .unwrap()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>(),
+        &[r#"warning[unknown_tag]: tag not in allowed list
+ --> line:1:13
+  |
+1 | rule test : axs ers { strings: $foo = "foo" condition: $foo }
+  |             --- tag `axs` not in allowed list
+  |
+  = note: allowed tags: foo, bar"#,
+             r#"warning[unknown_tag]: tag not in allowed list
+ --> line:1:17
+  |
+1 | rule test : axs ers { strings: $foo = "foo" condition: $foo }
+  |                 --- tag `ers` not in allowed list
+  |
+  = note: allowed tags: foo, bar"#,
+        ]
+    );
+
+    // Only the first error should be reported.
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::tags_allowed(vec![
+                "foo".to_string(),
+                "bar".to_string(),
+            ]).error(true))
+            .add_source(
+                r#"rule test : axs ers { strings: $foo = "foo" condition: $foo }"#
+            )
+            .expect_err("expected error")
+            .to_string(),
+        r#"error[E040]: tag not in allowed list
+ --> line:1:13
+  |
+1 | rule test : axs ers { strings: $foo = "foo" condition: $foo }
+  |             ^^^ tag `axs` not in allowed list
+  |
+  = note: allowed tags: foo, bar"#);
+}
+
+#[test]
+fn linter_tags_regexp() {
+    assert!(Compiler::new()
+        .add_linter(linters::tag_regex("^(foo|bar)").unwrap())
+        .add_source(
+            r#"rule test : foo1 bar2 { strings: $foo = "foo" condition: $foo }"#
+        )
+        .unwrap()
+        .warnings()
+        .is_empty());
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::tag_regex("^(foo|bar)").unwrap())
+            .add_source(
+                r#"rule test : baz blah { strings: $foo = "foo" condition: $foo }"#
+            )
+            .unwrap()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>(),
+        &[r#"warning[invalid_tag]: tag `baz` does not match regex `^(foo|bar)`
+ --> line:1:13
+  |
+1 | rule test : baz blah { strings: $foo = "foo" condition: $foo }
+  |             --- tag `baz` does not match regex `^(foo|bar)`
+  |"#,
+       r#"warning[invalid_tag]: tag `blah` does not match regex `^(foo|bar)`
+ --> line:1:17
+  |
+1 | rule test : baz blah { strings: $foo = "foo" condition: $foo }
+  |                 ---- tag `blah` does not match regex `^(foo|bar)`
+  |"#,
+    ]);
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::tag_regex("^(foo|bar)").unwrap().error(true))
+            .add_source(
+                r#"rule test : baz blah { strings: $foo = "foo" condition: $foo }"#
+            )
+            .expect_err("expected error")
+            .to_string(),
+        r#"error[E041]: tag does not match regex `^(foo|bar)`
+ --> line:1:13
+  |
+1 | rule test : baz blah { strings: $foo = "foo" condition: $foo }
+  |             ^^^ tag `baz` does not match regex `^(foo|bar)`
+  |"#);
+
+    assert!(linters::tag_regex("(AXS|ERS").is_err());
+}
+
+#[test]
+fn linter_rule_name() {
+    assert!(Compiler::new()
+        .add_linter(linters::rule_name("r_.+").unwrap())
+        .add_source(r#"rule r_foo { strings: $foo = "foo" condition: $foo }"#)
+        .unwrap()
+        .add_source(r#"rule r_bar { strings: $bar = "bar" condition: $bar }"#)
+        .unwrap()
+        .warnings()
+        .is_empty());
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::rule_name("r_.+").unwrap())
+            .add_source(
+                r#"rule foo { strings: $foo = "foo" condition: $foo }"#
+            )
+            .unwrap()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>(),
+        &[
+            r#"warning[invalid_rule_name]: rule name does not match regex `r_.+`
+ --> line:1:6
+  |
+1 | rule foo { strings: $foo = "foo" condition: $foo }
+  |      --- this rule name does not match regex `r_.+`
+  |"#
+        ]
+    );
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::rule_name("r_.+").unwrap().error(true))
+            .add_source(r#"rule foo { condition: true }"#)
+            .expect_err("expected error")
+            .to_string(),
+        "error[E039]: rule name does not match regex `r_.+`
+ --> line:1:6
+  |
+1 | rule foo { condition: true }
+  |      ^^^ this rule name does not match regex `r_.+`
+  |"
+    );
+
+    assert!(linters::rule_name("(AXS|ERS").is_err());
+}
+
+#[test]
+fn linter_required_metadata() {
+    assert!(Compiler::new()
+        .add_linter(linters::metadata("author").required(true))
+        .add_source(r#"rule r_foo { meta: author = "foo" strings: $foo = "foo" condition: $foo }"#)
+        .unwrap()
+        .warnings()
+        .is_empty());
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::metadata("author").required(true))
+            .add_source(
+                r#"rule foo { strings: $foo = "foo" condition: $foo }"#
+            )
+            .unwrap()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>(),
+        &[r#"warning[missing_metadata]: required metadata is missing
+ --> line:1:6
+  |
+1 | rule foo { strings: $foo = "foo" condition: $foo }
+  |      --- required metadata `author` not found
+  |"#]
+    );
+
+    assert_eq!(
+        Compiler::new()
+            .add_linter(linters::metadata("author").required(true).error(true))
+            .add_source(r#"rule foo { condition: true }"#)
+            .expect_err("expected error")
+            .to_string(),
+        "error[E038]: required metadata is missing
+ --> line:1:6
+  |
+1 | rule foo { condition: true }
+  |      ^^^ required metadata `author` not found
+  |"
+    );
+}
+
+#[cfg(feature = "test_proto2-module")]
+#[test]
 fn import_modules() {
     let mut compiler = Compiler::new();
     assert!(compiler
         .add_source(
             r#"
-            import "test_proto2" 
+            import "test_proto2"
             rule foo {condition: test_proto2.int32_zero == 0}"#
         )
         .unwrap()
         .add_source(
             r#"
-            import "test_proto2" 
+            import "test_proto2"
             rule bar {condition: test_proto2.int32_zero == 0}"#
         )
         .is_ok());
@@ -583,17 +854,73 @@ fn import_modules() {
     assert!(compiler
         .add_source(
             r#"
-            import "test_proto2" 
+            import "test_proto2"
             rule foo {condition: test_proto2.int32_zero == 0}"#
         )
         .unwrap()
         .new_namespace("namespace1")
         .add_source(
             r#"
-            import "test_proto2" 
+            import "test_proto2"
             rule bar {condition: test_proto2.int32_zero == 0}"#
         )
         .is_ok());
+}
+
+#[cfg(feature = "pe-module")]
+#[test]
+fn wrong_type() {
+    assert_eq!(
+        Compiler::new()
+            .add_source(
+                r#"
+            import "pe"
+            rule test { condition: pe.is_dll }"#
+            )
+            .expect_err("expected error")
+            .to_string(),
+        "error[E002]: wrong type
+ --> line:3:36
+  |
+3 |             rule test { condition: pe.is_dll }
+  |                                    ^^^^^^^^^ expression should be `bool`, but it is a function
+  |
+  = help: you probably meant pe.is_dll()"
+    );
+
+    assert_eq!(
+        Compiler::new()
+            .add_source(
+                r#"
+            import "pe"
+            rule test { condition: pe.sections }"#
+            )
+            .expect_err("expected error")
+            .to_string(),
+        "error[E002]: wrong type
+ --> line:3:36
+  |
+3 |             rule test { condition: pe.sections }
+  |                                    ^^^^^^^^^^^ expression should be `bool`, but it is an array
+  |"
+    );
+
+    assert_eq!(
+        Compiler::new()
+            .add_source(
+                r#"
+            import "pe"
+            rule test { condition: pe.version_info }"#
+            )
+            .expect_err("expected error")
+            .to_string(),
+        "error[E002]: wrong type
+ --> line:3:36
+  |
+3 |             rule test { condition: pe.version_info }
+  |                                    ^^^^^^^^^^^^^^^ expression should be `bool`, but it is a map
+  |"
+    );
 }
 
 #[test]
@@ -604,9 +931,9 @@ fn continue_after_error() {
     assert!(compiler
         .add_source(
             r#"
-            rule test { 
-                condition: 
-                    for any x in (1,2,3) : ( x contains "foo") 
+            rule test {
+                condition:
+                    for any x in (1,2,3) : ( x contains "foo")
             }"#
         )
         .is_err());
@@ -622,9 +949,9 @@ fn continue_after_error() {
     assert!(compiler
         .add_source(
             r#"
-            rule test { 
-                condition: 
-                    for any x in (1,2,3) : ( x contains "foo") 
+            rule test {
+                condition:
+                    for any x in (1,2,3) : ( x contains "foo")
             }"#
         )
         .is_err());
@@ -635,7 +962,7 @@ fn continue_after_error() {
 }
 
 #[test]
-fn errors_2() {
+fn conflicting_identifiers_error() {
     assert_eq!(
         Compiler::new()
             .define_global("foo", 1)
@@ -643,14 +970,17 @@ fn errors_2() {
             .add_source("rule foo  {condition: true}")
             .unwrap_err()
             .to_string(),
-        "error: rule `foo` conflicts with an existing identifier
+        "error[E013]: rule `foo` conflicts with an existing identifier
  --> line:1:6
   |
 1 | rule foo  {condition: true}
   |      ^^^ identifier already in use by a module or global variable
   |"
     );
+}
 
+#[test]
+fn duplicate_rule_error() {
     assert_eq!(
         Compiler::new()
             .add_source("rule foo : first {condition: true}")
@@ -658,20 +988,23 @@ fn errors_2() {
             .add_source("rule foo : second {condition: true}")
             .unwrap_err()
             .to_string(),
-        "error: duplicate rule `foo`
+        "error[E012]: duplicate rule `foo`
  --> line:1:6
-  |
-1 | rule foo : first {condition: true}
-  |      --- note: `foo` declared here for the first time
-  |
- ::: line:1:6
   |
 1 | rule foo : second {condition: true}
   |      ^^^ duplicate declaration of `foo`
+  |
+ ::: line:1:6
+  |
+1 | rule foo : first {condition: true}
+  |      --- note: `foo` declared here for the first time
   |"
     );
+}
 
-    #[cfg(feature = "constant-folding")]
+#[cfg(feature = "constant-folding")]
+#[test]
+fn number_out_of_range_error() {
     assert_eq!(
         Compiler::new()
             .add_source(
@@ -682,7 +1015,7 @@ condition:
             )
             .unwrap_err()
             .to_string(),
-        "error: number out of range
+        "error[E007]: number out of range
  --> line:3:4
   |
 3 |    9223372036854775807 + 1000000000 == 0
@@ -700,17 +1033,57 @@ fn utf8_errors() {
     src.insert(4, 0xff);
 
     assert_eq!(
-        Parser::new()
-            .build_ast(src.as_slice())
+        Compiler::new()
+            .add_source(src.as_slice())
             .expect_err("expected error")
             .to_string(),
-        "error: invalid UTF-8
+        "error[E032]: invalid UTF-8
  --> line:1:5
   |
 1 | rule� test {condition: true}
   |     ^ invalid UTF-8 character
   |"
     );
+}
+
+#[test]
+fn errors_serialization() {
+    let err = Compiler::new()
+        .add_source(
+            SourceCode::from("rule test {condition: foo}")
+                .with_origin("test.yar"),
+        )
+        .err()
+        .unwrap();
+
+    let json_error = serde_json::to_string(&err).unwrap();
+
+    let expected = json!({
+        "type": "UnknownIdentifier",
+        "code": "E009",
+        "title": "unknown identifier `foo`",
+        "line": 1,
+        "column": 23,
+        "labels":[
+            {
+                "level": "error",
+                "code_origin": "test.yar",
+                "line": 1,
+                "column": 23,
+                "span": { "start": 22, "end": 25 },
+                "text": "this identifier has not been declared"
+            }
+        ],
+        "footers": [],
+        "text": r#"error[E009]: unknown identifier `foo`
+ --> test.yar:1:23
+  |
+1 | rule test {condition: foo}
+  |                       ^^^ this identifier has not been declared
+  |"#
+    });
+
+    assert_eq!(json_error, expected.to_string());
 }
 
 #[test]
@@ -724,6 +1097,8 @@ fn test_errors() {
         // Path to the .in file.
         let in_path = entry.into_path();
 
+        println!("{:?}", in_path);
+
         // Path to the .out file.
         let out_path = in_path.with_extension("out");
 
@@ -731,11 +1106,24 @@ fn test_errors() {
 
         let rules = fs::read_to_string(&in_path).expect("unable to read");
 
+        // If the `constant-folding` feature is not enabled ignore files
+        // starting with "// constant-folding required".
+        #[cfg(not(feature = "constant-folding"))]
+        if rules.starts_with("// constant-folding required") {
+            continue;
+        }
+
+        // If the `test_proto2-module` feature is not enabled ignore files
+        // starting with "// test_proto2-module required".
+        #[cfg(not(feature = "test_proto2-module"))]
+        if rules.starts_with("// test_proto2-module required") {
+            continue;
+        }
+
         src.push_str(rules.as_str());
 
         let err = compile(src.as_str()).expect_err(
-            format!("file {:?} should have failed with error", in_path)
-                .as_str(),
+            format!("file {:?} should have failed", in_path).as_str(),
         );
 
         let mut output_file = mint.new_goldenfile(out_path).unwrap();
@@ -757,15 +1145,31 @@ fn test_warnings() {
         // Path to the .in file.
         let in_path = entry.into_path();
 
+        println!("{:?}", in_path);
+
         // Path to the .out file.
         let out_path = in_path.with_extension("out");
 
         let mut src = String::new();
         let rules = fs::read_to_string(&in_path).expect("unable to read");
 
-        src.push_str(rules.as_str());
+        // If the `constant-folding` feature is not enabled ignore files
+        // starting with "// constant-folding required".
+        #[cfg(not(feature = "constant-folding"))]
+        if rules.starts_with("// constant-folding required") {
+            continue;
+        }
+
+        // If the `test_proto2-module` feature is not enabled ignore files
+        // starting with "// test_proto2-module required".
+        #[cfg(not(feature = "test_proto2-module"))]
+        if rules.starts_with("// test_proto2-module required") {
+            continue;
+        }
 
         let mut compiler = Compiler::new();
+
+        src.push_str(rules.as_str());
 
         compiler.ignore_module("unsupported_module");
         compiler.add_source(src.as_str()).unwrap();
@@ -773,9 +1177,9 @@ fn test_warnings() {
         let mut output_file = mint.new_goldenfile(out_path).unwrap();
 
         for w in compiler.warnings() {
-            output_file
-                .write_all(w.to_string().as_bytes())
-                .expect("unable to write");
+            let mut s = w.to_string();
+            s.push('\n');
+            output_file.write_all(s.as_bytes()).expect("unable to write");
         }
     }
 }

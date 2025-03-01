@@ -16,21 +16,26 @@ Formatter::new().format(input, output).unwrap();
 ```
 */
 use std::io;
+use std::io::Cursor;
 
 use thiserror::Error;
-use yara_x_parser::GrammarRule;
-use yara_x_parser::Parser;
 
 use tokens::Token::*;
 use tokens::TokenStream;
+use yara_x_parser::cst::{Event, SyntaxKind};
+use yara_x_parser::{Parser, Span};
 
 use crate::align::Align;
+use crate::format_hex_patterns::FormatHexPatterns;
+use crate::indentation::AddIndentationSpaces;
 use crate::tokens::categories::*;
 use crate::tokens::*;
+use crate::trailing_spaces::RemoveTrailingSpaces;
 
 mod align;
 mod bubble;
 mod comments;
+mod format_hex_patterns;
 mod indentation;
 mod processor;
 mod tokens;
@@ -44,20 +49,29 @@ mod tests;
 #[allow(clippy::large_enum_variant)]
 pub enum Error {
     /// Error while reading from input.
-    #[error("Read error")]
+    #[error("read error: {0}")]
     ReadError(io::Error),
 
     /// Error while writing to output.
-    #[error("Write error")]
+    #[error("write error: {0}")]
     WriteError(io::Error),
 
-    /// Error while parsing the input.
-    #[error("Parse error")]
-    ParseError(#[from] yara_x_parser::Error),
+    /// The input file contained invalid UTF-8.
+    #[error("invalid UTF-8 at {0}")]
+    InvalidUTF8(Span),
 }
 
 /// Formats YARA source code automatically.
-pub struct Formatter {}
+pub struct Formatter {
+    align_metadata: bool,
+    align_patterns: bool,
+    indent_section_headers: bool,
+    indent_section_contents: bool,
+    indent_spaces: u8,
+    newline_before_curly_brace: bool,
+    empty_line_before_section_header: bool,
+    empty_line_after_section_header: bool,
+}
 
 impl Default for Formatter {
     fn default() -> Self {
@@ -69,43 +83,299 @@ impl Default for Formatter {
 impl Formatter {
     /// Creates a new formatter.
     pub fn new() -> Self {
-        Formatter {}
+        Formatter {
+            align_metadata: true,
+            align_patterns: true,
+            indent_section_headers: true,
+            indent_section_contents: true,
+            indent_spaces: 2,
+            newline_before_curly_brace: false,
+            empty_line_before_section_header: true,
+            empty_line_after_section_header: false,
+        }
+    }
+
+    /// Specify if the metadata block must be aligned.
+    ///
+    /// If true, the metadata block will be converted from this...
+    ///
+    /// ```text
+    /// rule test {
+    ///   meta:
+    ///     short = "foo"
+    ///     very_long = "bar"
+    ///     even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// ... to this ...
+    ///
+    /// ```text
+    /// rule test {
+    ///   meta:
+    ///     short       = "foo"
+    ///     very_long   = "bar"
+    ///     even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// The default value is `true`.
+    pub fn align_metadata(mut self, yes: bool) -> Self {
+        self.align_metadata = yes;
+        self
+    }
+
+    /// Specify if the patterns definitions must be aligned.
+    ///
+    /// If true, the strings block will be converted from this...
+    ///
+    /// ```text
+    /// rule test {
+    ///   strings:
+    ///     $short = "foo"
+    ///     $very_long = "bar"
+    ///     $even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// ... to this ...
+    ///
+    /// ```text
+    /// rule test {
+    ///   strings:
+    ///     $short       = "foo"
+    ///     $very_long   = "bar"
+    ///     $even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// The default value is `true`.
+    pub fn align_patterns(mut self, yes: bool) -> Self {
+        self.align_patterns = yes;
+        self
+    }
+
+    /// Specify if the section definitions must be aligned.
+    ///
+    /// If true, the section headers look like this...
+    ///
+    /// ```text
+    /// rule test {
+    ///   strings:
+    ///     $short = "foo"
+    ///     $very_long = "bar"
+    ///     $even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// And if false, the section headers look like this...
+    ///
+    /// ```text
+    /// rule test {
+    /// strings:
+    ///   $short       = "foo"
+    ///   $very_long   = "bar"
+    ///   $even_longer = "baz"
+    /// condition:
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// The default value is `true`.
+    pub fn indent_section_headers(mut self, yes: bool) -> Self {
+        self.indent_section_headers = yes;
+        self
+    }
+
+    /// Specify if the section contents must be aligned.
+    ///
+    /// If true, the section contents look like this...
+    ///
+    /// ```text
+    /// rule test {
+    ///   strings:
+    ///     $short = "foo"
+    ///     $very_long = "bar"
+    ///     $even_longer = "baz"
+    ///   condition:
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// And if false, the section contents look like this...
+    ///
+    /// ```text
+    /// rule test {
+    ///   strings:
+    ///   $short       = "foo"
+    ///   $very_long   = "bar"
+    ///   $even_longer = "baz"
+    ///   condition:
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// The default value is `true`.
+    pub fn indent_section_contents(mut self, yes: bool) -> Self {
+        self.indent_section_contents = yes;
+        self
+    }
+
+    /// Number of spaces to indent, if indenting at all. Set to 0 to use tabs.
+    ///
+    /// The default is `2`.
+    pub fn indent_spaces(mut self, n: u8) -> Self {
+        self.indent_spaces = n;
+        self
+    }
+
+    /// Specify if newline should be added before the opening curly brace in a
+    /// rule declaration. If false the rule will look like this:
+    ///
+    /// ```text
+    /// rule test {
+    ///   condition:
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// And if true, the rule will look like this:
+    ///
+    /// ```text
+    /// rule test
+    /// {
+    ///   condition:
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// The default value is `false`.
+    pub fn newline_before_curly_brace(mut self, yes: bool) -> Self {
+        self.newline_before_curly_brace = yes;
+        self
+    }
+
+    /// Specify if an empty line should be added before the section header in a
+    /// rule. If false the rule will look like this:
+    ///
+    /// ```text
+    /// rule test {
+    ///   meta:
+    ///     foo = "bar"
+    ///   condition:
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// And if true, the rule will look like this:
+    ///
+    /// ```text
+    /// rule test {
+    ///
+    ///   meta:
+    ///     foo = "bar"
+    ///
+    ///   condition:
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// The default value is `false`.
+    pub fn empty_line_before_section_header(mut self, yes: bool) -> Self {
+        self.empty_line_before_section_header = yes;
+        self
+    }
+
+    /// Specify if an empty line should be added after the section header in a
+    /// rule. If false the rule will look like this:
+    ///
+    /// ```text
+    /// rule test {
+    ///   condition:
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// And if true, the rule will look like this:
+    ///
+    /// ```text
+    /// rule test {
+    ///   condition:
+    ///
+    ///     true
+    /// }
+    /// ```
+    ///
+    /// The default value is `false`.
+    pub fn empty_line_after_section_header(mut self, yes: bool) -> Self {
+        self.empty_line_after_section_header = yes;
+        self
     }
 
     /// Reads YARA source code from `input` and write it into `output` after
     /// formatting.
     ///
+    /// Returns `true` if the output differs from the input.
+    ///
     /// This function will fail if it can't read from the input, write to the
-    /// output, or when the input doesn't contain syntactically valid YARA
-    /// rules.
-    pub fn format<R, W>(&self, mut input: R, output: W) -> Result<(), Error>
+    /// output, or when the input contains invalid UTF-8 characters.
+    pub fn format<R, W>(
+        &self,
+        mut input: R,
+        mut output: W,
+    ) -> Result<bool, Error>
     where
         R: io::Read,
         W: io::Write,
     {
-        let mut buf = String::new();
+        let mut invalid_utf8 = Option::None;
+        let mut in_buf = Vec::with_capacity(256);
 
-        // Read the source code from input and store it in buf.
-        input.read_to_string(&mut buf).map_err(Error::ReadError)?;
+        input.read_to_end(&mut in_buf).map_err(Error::ReadError)?;
 
-        let parser = Parser::new();
+        let cst_stream = Parser::new(in_buf.as_slice()).into_cst_stream();
 
-        // Build a CST that maintains comments and whitespaces.
-        let cst =
-            parser.build_cst(buf.as_str())?.comments(true).whitespaces(true);
+        // Inspect the CST stream looking for events indicating the presence of
+        // invalid UTF-8 sequences.
+        let events = cst_stream.into_iter().inspect(|evt| {
+            if let Event::Token { kind: SyntaxKind::INVALID_UTF8, span } = evt
+            {
+                invalid_utf8.get_or_insert(span.clone());
+            }
+        });
 
-        // Generate a stream of tokens from the CST.
-        let tokens = tokens::Tokens::new(cst);
+        let tokens = Tokens::new(in_buf.as_slice(), events);
+        let mut out_buf = Cursor::new(Vec::new());
 
-        Formatter::formatter(tokens)
-            .write_to(output)
-            .map_err(Error::WriteError)
+        self.format_impl(tokens)
+            .write_to(&mut out_buf)
+            .map_err(Error::WriteError)?;
+
+        if let Some(span) = invalid_utf8 {
+            return Err(Error::InvalidUTF8(span));
+        }
+
+        let modified = in_buf.ne(out_buf.get_ref());
+
+        output.write_all(out_buf.get_ref()).map_err(Error::WriteError)?;
+
+        Ok(modified)
     }
 }
 
 // Private API for formatter.
 impl Formatter {
-    fn formatter<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    fn format_impl<'a, I>(&self, input: I) -> impl TokenStream<'a> + 'a
     where
         I: TokenStream<'a> + 'a,
     {
@@ -133,12 +403,12 @@ impl Formatter {
         //
         // The sequence of tokens produced for that rule looks like:
         //
-        //   Begin(source_file)
-        //   Begin(import_stmt)
+        //   Begin(SOURCE_FILE)
+        //   Begin(IMPORT_STMT)
         //   Keyword("import")
         //   Literal("tests")
-        //   End(import_stmt)
-        //   Begin(rule_decl)
+        //   End(IMPORT_STMT)
+        //   Begin(RULE_DECL)
         //   TailComment("// Comment")
         //   Newline
         //   Keyword("rule")
@@ -149,14 +419,14 @@ impl Formatter {
         // grammar rule. This is not the most natural place for this tail comment,
         // its natural place is just after the "tests" literal, like this:
         //
-        //   Begin(source_file)
-        //   Begin(import_stmt)
+        //   Begin(SOURCE_FILE)
+        //   Begin(IMPORT_STMT)
         //   Keyword("import")
         //   Literal("tests")
         //   TailComment("// Comment")
         //   Newline
-        //   End(import_stmt)
-        //   Begin(rule_decl)
+        //   End(IMPORT_STMT)
+        //   Begin(RULE_DECL)
         //   Keyword("rule")
         //   .... more
         //
@@ -184,29 +454,27 @@ impl Formatter {
             // Remove all newlines at the beginning of the file. When the
             // processor is at the beginning of the file token(-1) is None.
             // Notice that this works because all these newlines have been
-            // moved up and placed Token::Begin(source_file) by the first
-            // bubble pipeline.
+            // moved up and placed before Token::Begin(source_file) by the
+            // first bubble pipeline.
             .add_rule(
-                |ctx| {
-                    ctx.token(-1).eq(&Token::None) && ctx.token(1).is(*NEWLINE)
-                },
+                |ctx| ctx.token(-1).eq(&None) && ctx.token(1).is(*NEWLINE),
                 processor::actions::drop,
             )
             // Remove excess of consecutive newlines, only two consecutive
             // newlines are allowed.
             .add_rule(
                 |ctx| {
-                    ctx.token(-2).is(*NEWLINE)
-                        && ctx.token(-1).is(*NEWLINE)
-                        && ctx.token(1).is(*NEWLINE)
+                    ctx.token(1).is(*NEWLINE)
+                        && ctx.token(2).is(*NEWLINE)
+                        && ctx.token(3).is(*NEWLINE)
                 },
                 processor::actions::drop,
             )
             // Remove newlines between rule tags and between rule modifiers.
             .add_rule(
                 |ctx| {
-                    (ctx.in_rule(GrammarRule::rule_mods, false)
-                        || ctx.in_rule(GrammarRule::rule_tags, false))
+                    (ctx.in_rule(SyntaxKind::RULE_MODS, false)
+                        || ctx.in_rule(SyntaxKind::RULE_TAGS, false))
                         && ctx.token(-1).is_not(*COMMENT)
                         && ctx.token(1).is(*NEWLINE)
                 },
@@ -215,37 +483,53 @@ impl Formatter {
             // Remove newlines after rule modifiers.
             .add_rule(
                 |ctx| {
-                    ctx.token(-1).eq(&End(GrammarRule::rule_mods))
+                    ctx.token(-1).eq(&End(SyntaxKind::RULE_MODS))
                         && ctx.token(1).is(*NEWLINE)
                 },
                 processor::actions::drop,
             )
-            // Remove newlines after rule tags
+            // Remove newlines after rule tags.
             .add_rule(
                 |ctx| {
-                    ctx.token(-1).eq(&End(GrammarRule::rule_tags))
-                        && ctx.token(1).is(*NEWLINE)
-                },
-                processor::actions::drop,
-            )
-            // Remove newlines after "meta:"
-            .add_rule(
-                |ctx| {
-                    ctx.in_rule(GrammarRule::meta_defs, false)
-                        && ctx.token(-1).eq(&COLON)
-                        && ctx.token(1).is(*NEWLINE)
-                },
-                processor::actions::drop,
-            )
-            // Remove newlines after "strings:"
-            .add_rule(
-                |ctx| {
-                    ctx.in_rule(GrammarRule::pattern_defs, false)
-                        && ctx.token(-1).eq(&COLON)
+                    ctx.token(-1).eq(&End(SyntaxKind::RULE_TAGS))
                         && ctx.token(1).is(*NEWLINE)
                 },
                 processor::actions::drop,
             );
+
+        let tokens = if self.newline_before_curly_brace {
+            // Ensure we have a newline before the opening "{" in a rule
+            // declaration. Be careful to only insert it if one does not already
+            // exist.
+            Box::new(processor::Processor::new(tokens).add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::RULE_DECL, false)
+                        && ctx.token(1).eq(&LBRACE)
+                        && ctx.token(-1).is_not(*NEWLINE)
+                },
+                processor::actions::newline,
+            ))
+        } else {
+            // Remove newlines before the opening "{" in a rule declaration.
+            // It takes into account that we can have one or two newlines
+            // before the "{" character. In a previous step we have removed
+            // consecutive newlines leaving two at most.
+            Box::new(
+                    processor::Processor::new(tokens)
+                .add_rule(
+                    |ctx| {
+                        ctx.in_rule(SyntaxKind::RULE_DECL, false)
+                            && ctx.token(1).is(*NEWLINE)
+                            && (
+                                // Newline followed by "{"  or ...
+                                ctx.token(2).eq(&LBRACE) ||
+                                // ... two newlines followed by "{"
+                                ctx.token(2).is(*NEWLINE) && ctx.token(3).eq(&LBRACE)
+                            )
+                    },
+                    processor::actions::drop,
+                ))
+        };
 
         let tokens = processor::Processor::new(tokens)
             //
@@ -264,8 +548,8 @@ impl Formatter {
                     let next_token = ctx.token(1);
                     let prev_token = ctx.token(-1);
 
-                    next_token.eq(&Begin(GrammarRule::import_stmt))
-                        && prev_token.neq(&Begin(GrammarRule::source_file))
+                    next_token.eq(&Begin(SyntaxKind::IMPORT_STMT))
+                        && prev_token.neq(&Begin(SyntaxKind::SOURCE_FILE))
                         && prev_token.is_not(*NEWLINE)
                 },
                 processor::actions::newline,
@@ -286,8 +570,8 @@ impl Formatter {
                     let next_token = ctx.token(1);
                     let prev_token = ctx.token(-1);
 
-                    next_token.eq(&Begin(GrammarRule::rule_decl))
-                        && prev_token.neq(&Begin(GrammarRule::source_file))
+                    next_token.eq(&Begin(SyntaxKind::RULE_DECL))
+                        && prev_token.neq(&Begin(SyntaxKind::SOURCE_FILE))
                         && prev_token.is_not(*NEWLINE)
                 },
                 processor::actions::newline,
@@ -312,50 +596,173 @@ impl Formatter {
             //
             .add_rule(
                 |ctx| {
-                    ctx.token(1).eq(&Begin(GrammarRule::rule_decl))
+                    ctx.token(1).eq(&Begin(SyntaxKind::RULE_DECL))
                         && ctx.token(-1).is(*NEWLINE)
                         && ctx.token(-2).is_not(*NEWLINE | *COMMENT)
                 },
                 processor::actions::newline,
             )
             //
-            //
             // Insert empty line at the end of the file
             //
             .add_rule(
                 |ctx| {
-                    ctx.token(1).eq(&End(GrammarRule::source_file))
+                    ctx.token(1).eq(&End(SyntaxKind::SOURCE_FILE))
                         && ctx.token(-1).is_not(*NEWLINE)
                         && ctx.token(2).is_not(*NEWLINE)
                 },
                 processor::actions::newline,
             );
 
+        let tokens = if self.empty_line_before_section_header {
+            Box::new(
+                processor::Processor::new(tokens)
+                    .set_passthrough(*CONTROL)
+                    .add_rule(
+                        |ctx| {
+                            matches!(
+                                ctx.token(1),
+                                Keyword(b"meta")
+                                    | Keyword(b"strings")
+                                    | Keyword(b"condition")
+                            ) && ctx.token(-1).is_not(*NEWLINE)
+                        },
+                        processor::actions::emptyline,
+                    )
+                    .add_rule(
+                        |ctx| {
+                            matches!(
+                                ctx.token(1),
+                                Keyword(b"meta")
+                                    | Keyword(b"strings")
+                                    | Keyword(b"condition")
+                            ) && ctx.token(-1).is(*NEWLINE)
+                                && ctx.token(-2).is_not(*NEWLINE)
+                        },
+                        processor::actions::newline,
+                    ),
+            )
+        } else {
+            Box::new(
+                processor::Processor::new(tokens)
+                    .set_passthrough(*CONTROL)
+                    .add_rule(
+                        |ctx| {
+                            matches!(
+                                ctx.token(1),
+                                Keyword(b"meta")
+                                    | Keyword(b"strings")
+                                    | Keyword(b"condition")
+                            ) && ctx.token(-1).is_not(*NEWLINE)
+                        },
+                        processor::actions::newline,
+                    )
+                    .add_rule(
+                        |ctx| {
+                            ctx.token(1).is(*NEWLINE)
+                                && matches!(
+                                    ctx.token(2),
+                                    Keyword(b"meta")
+                                        | Keyword(b"strings")
+                                        | Keyword(b"condition")
+                                )
+                                && ctx.token(-1).is(*NEWLINE)
+                        },
+                        processor::actions::drop,
+                    ),
+            )
+        };
+
+        // Always remove empty line before the first section header.
         let tokens = processor::Processor::new(tokens)
             .set_passthrough(*CONTROL)
-            // Add newline in front of "meta", "strings" and "condition"
             .add_rule(
                 |ctx| {
-                    matches!(
-                        ctx.token(1),
-                        Keyword("meta")
-                            | Keyword("strings")
-                            | Keyword("condition")
-                    ) && ctx.token(-1).is_not(*NEWLINE)
-                },
-                processor::actions::newline,
-            )
-            // Add newline after "meta:", "strings:" and "condition:".
-            .add_rule(
-                |ctx| {
-                    ctx.token(1).is_not(*NEWLINE)
-                        && ctx.token(-1).eq(&COLON)
+                    ctx.token(1).is(*NEWLINE)
                         && matches!(
-                            ctx.token(-2),
-                            Keyword("meta")
-                                | Keyword("strings")
-                                | Keyword("condition")
+                            ctx.token(2),
+                            Keyword(b"meta")
+                                | Keyword(b"strings")
+                                | Keyword(b"condition")
                         )
+                        && ctx.token(-1).is(*NEWLINE)
+                        && ctx.token(-2).eq(&LBRACE)
+                },
+                processor::actions::drop,
+            );
+
+        let tokens = if self.empty_line_after_section_header {
+            Box::new(
+                processor::Processor::new(tokens)
+                    .add_rule(
+                        |ctx| {
+                            ctx.token(-1).eq(&COLON)
+                                && matches!(
+                                    ctx.token(-2),
+                                    Keyword(b"meta")
+                                        | Keyword(b"strings")
+                                        | Keyword(b"condition")
+                                )
+                                && ctx.token(1).is_not(*NEWLINE)
+                        },
+                        processor::actions::emptyline,
+                    )
+                    .add_rule(
+                        |ctx| {
+                            ctx.token(-1).eq(&COLON)
+                                && matches!(
+                                    ctx.token(-2),
+                                    Keyword(b"meta")
+                                        | Keyword(b"strings")
+                                        | Keyword(b"condition")
+                                )
+                                && ctx.token(1).is(*NEWLINE)
+                                && ctx.token(2).is_not(*NEWLINE)
+                        },
+                        processor::actions::newline,
+                    ),
+            )
+        } else {
+            Box::new(
+                processor::Processor::new(tokens)
+                    .add_rule(
+                        |ctx| {
+                            ctx.token(-1).eq(&COLON)
+                                && matches!(
+                                    ctx.token(-2),
+                                    Keyword(b"meta")
+                                        | Keyword(b"strings")
+                                        | Keyword(b"condition")
+                                )
+                                && ctx.token(1).is_not(*NEWLINE)
+                        },
+                        processor::actions::newline,
+                    )
+                    .add_rule(
+                        |ctx| {
+                            ctx.token(-1).eq(&COLON)
+                                && matches!(
+                                    ctx.token(-2),
+                                    Keyword(b"meta")
+                                        | Keyword(b"strings")
+                                        | Keyword(b"condition")
+                                )
+                                && ctx.token(1).is(*NEWLINE)
+                                && ctx.token(2).is(*NEWLINE)
+                        },
+                        processor::actions::drop,
+                    ),
+            )
+        };
+
+        let tokens = processor::Processor::new(tokens)
+            .set_passthrough(*CONTROL)
+            // Add a newline in front of meta definitions in the "meta" section.
+            .add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::META_DEF, false)
+                        && ctx.token(1).is(*IDENTIFIER)
+                        && ctx.token(-1).is_not(*NEWLINE)
                 },
                 processor::actions::newline,
             )
@@ -363,7 +770,16 @@ impl Formatter {
             // section.
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::pattern_def, false)
+                    ctx.in_rule(SyntaxKind::PATTERN_DEF, false)
+                        && ctx.token(1).is(*IDENTIFIER)
+                        && ctx.token(-1).is_not(*NEWLINE)
+                },
+                processor::actions::newline,
+            )
+            // Add newline before each identifier in a `with` statement.
+            .add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::WITH_DECL, false)
                         && ctx.token(1).is(*IDENTIFIER)
                         && ctx.token(-1).is_not(*NEWLINE)
                 },
@@ -372,16 +788,32 @@ impl Formatter {
             // Add newline before the closing brace at the end of rule.
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::rule_decl, false)
+                    ctx.in_rule(SyntaxKind::RULE_DECL, false)
                         && ctx.token(1).eq(&RBRACE)
                         && ctx.token(-1).is_not(*NEWLINE)
                 },
                 processor::actions::newline,
             );
 
-        let tokens = Self::indent_body(tokens);
-        let tokens = Self::indent_sections(tokens);
+        let tokens = FormatHexPatterns::new(tokens);
+
+        let tokens: Box<dyn Iterator<Item = Token<'a>>> =
+            if self.indent_section_headers {
+                Box::new(Self::indent_body(tokens))
+            } else {
+                Box::new(tokens)
+            };
+
+        let tokens: Box<dyn Iterator<Item = Token<'a>>> =
+            if self.indent_section_contents {
+                Box::new(Self::indent_sections(tokens))
+            } else {
+                Box::new(tokens)
+            };
+
+        let tokens = Self::indent_hex_patterns(tokens);
         let tokens = Self::indent_parenthesized_exprs(tokens);
+        let tokens = Self::indent_with_expr(tokens);
 
         // indent_body and indent_sections will insert Indentation tokens, but
         // won't take into account that those tokens must appear before the
@@ -390,7 +822,7 @@ impl Formatter {
         // reverse order.
         let tokens = bubble::Bubble::new(
             tokens,
-            |token| matches!(token, Token::Indentation(_)),
+            |token| matches!(token, Indentation(_)),
             |token| token.is(*NEWLINE),
         );
 
@@ -401,43 +833,57 @@ impl Formatter {
             .set_passthrough(*CONTROL)
             .add_rule(
                 |ctx| {
-                    matches!(
-                        ctx.token(-1),
-                        Token::TailComment(_) | Token::BlockComment(_)
-                    ) && ctx.token(1).is_not(*NEWLINE)
+                    matches!(ctx.token(-1), TailComment(_) | BlockComment(_))
+                        && ctx.token(1).is_not(*NEWLINE)
                 },
                 processor::actions::newline,
             );
 
         let tokens = Self::add_spacing(tokens);
-
         let tokens = Self::align_comments_in_hex_patterns(tokens);
-        let tokens = Self::align_patterns(tokens);
 
-        let tokens = indentation::AddIndentationSpaces::new(tokens);
-        let tokens = trailing_spaces::RemoveTrailingSpaces::new(tokens);
+        let tokens: Box<dyn Iterator<Item = Token<'a>>> =
+            if self.align_metadata {
+                Box::new(Self::align_meta_section(tokens))
+            } else {
+                Box::new(tokens)
+            };
+
+        let tokens: Box<dyn Iterator<Item = Token<'a>>> =
+            if self.align_patterns {
+                Box::new(Self::align_patterns_section(tokens))
+            } else {
+                Box::new(tokens)
+            };
+
+        let tokens = AddIndentationSpaces::new(tokens, self.indent_spaces);
+        let tokens = RemoveTrailingSpaces::new(tokens);
 
         tokens
     }
 
     /// Indents the sections (meta, strings, condition) of a rule one level up.
-    /// For example, for this input..
+    /// For example, for this input:
     ///
+    /// ```text
     /// rule foo {
     /// strings:
     /// $a = "foo"
     /// condition:
     /// true
     /// }
+    /// ```
     ///
     /// ... the result is ...
     ///
+    /// ```text
     /// rule foo {
     /// strings:
     ///   $a = "foo"
     /// condition:
     ///   true
-    ///
+    /// }
+    /// ```
     fn indent_sections<'a, I>(input: I) -> impl TokenStream<'a> + 'a
     where
         I: TokenStream<'a> + 'a,
@@ -448,7 +894,7 @@ impl Formatter {
             // Increase indentation after "condition:"
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::rule_decl, false)
+                    ctx.in_rule(SyntaxKind::CONDITION_BLK, false)
                         && ctx.token(-1).eq(&COLON)
                 },
                 processor::actions::insert(Indentation(1)),
@@ -456,15 +902,15 @@ impl Formatter {
             // Decrease indentation after the condition.
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::rule_decl, false)
-                        && ctx.token(-1).eq(&End(GrammarRule::boolean_expr))
+                    ctx.token(1).eq(&End(SyntaxKind::CONDITION_BLK))
+                        && ctx.token(-1).neq(&Indentation(-1))
                 },
                 processor::actions::insert(Indentation(-1)),
             )
             // Increase indentation after "meta:"
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::meta_defs, false)
+                    ctx.in_rule(SyntaxKind::META_BLK, false)
                         && ctx.token(-1).eq(&COLON)
                 },
                 processor::actions::insert(Indentation(1)),
@@ -472,7 +918,7 @@ impl Formatter {
             // Decrease indentation after meta definitions
             .add_rule(
                 |ctx| {
-                    ctx.token(1).eq(&End(GrammarRule::meta_defs))
+                    ctx.token(1).eq(&End(SyntaxKind::META_BLK))
                         && ctx.token(-1).neq(&Indentation(-1))
                 },
                 processor::actions::insert(Indentation(-1)),
@@ -480,7 +926,7 @@ impl Formatter {
             // Increase indentation after "strings:"
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::pattern_defs, false)
+                    ctx.in_rule(SyntaxKind::PATTERNS_BLK, false)
                         && ctx.token(-1).eq(&COLON)
                 },
                 processor::actions::insert(Indentation(1)),
@@ -488,7 +934,7 @@ impl Formatter {
             // Decrease indentation after pattern definitions.
             .add_rule(
                 |ctx| {
-                    ctx.token(1).eq(&End(GrammarRule::pattern_defs))
+                    ctx.token(1).eq(&End(SyntaxKind::PATTERNS_BLK))
                         && ctx.token(-1).neq(&Indentation(-1))
                 },
                 processor::actions::insert(Indentation(-1)),
@@ -497,21 +943,24 @@ impl Formatter {
 
     /// Indents the body of a rule. For this input...
     ///
+    /// ```text
     /// rule foo {
     /// strings:
     /// $a = "foo"
     /// condition:
     /// true
     /// }
-    ///
+    /// ```
     /// ... the result is ...
     ///
+    /// ```text
     /// rule foo {
     ///   strings:
     ///   $a = "foo"
     ///   condition:
     ///   true
     /// }
+    /// ```
     ///
     fn indent_body<'a, I>(input: I) -> impl TokenStream<'a> + 'a
     where
@@ -524,14 +973,14 @@ impl Formatter {
             // declaration.
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::rule_decl, false)
+                    ctx.in_rule(SyntaxKind::RULE_DECL, false)
                         && ctx.token(-1).eq(&LBRACE)
                 },
                 processor::actions::insert(Indentation(1)),
             )
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::rule_decl, false)
+                    ctx.in_rule(SyntaxKind::RULE_DECL, false)
                         && ctx.token(1).eq(&RBRACE)
                         && ctx.token(-1).neq(&Indentation(-1))
                 },
@@ -539,8 +988,9 @@ impl Formatter {
             )
     }
 
-    /// Indent parenthesized expressions in rule conditions.
+    /// Indent parenthesized expressions in rule conditions. For this input...
     ///
+    /// ```text
     /// rule foo {
     /// strings:
     ///   $a = "foo"
@@ -550,9 +1000,11 @@ impl Formatter {
     ///    $a and $b
     ///    )
     /// }
+    /// ```
     ///
     /// ... the result is ...
     ///
+    /// ```text
     /// rule foo {
     /// strings:
     ///   $a = "foo"
@@ -562,7 +1014,7 @@ impl Formatter {
     ///      $a and $b
     ///    )
     /// }
-    ///
+    /// ```
     fn indent_parenthesized_exprs<'a, I>(input: I) -> impl TokenStream<'a> + 'a
     where
         I: TokenStream<'a> + 'a,
@@ -571,14 +1023,14 @@ impl Formatter {
             .set_passthrough(*COMMENT)
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::boolean_expr, true)
+                    ctx.in_rule(SyntaxKind::BOOLEAN_EXPR, true)
                         && ctx.token(-1).eq(&LPAREN)
                 },
                 processor::actions::insert(Indentation(1)),
             )
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::boolean_expr, true)
+                    ctx.in_rule(SyntaxKind::BOOLEAN_EXPR, true)
                         && ctx.token(1).eq(&RPAREN)
                         && ctx.token(-1).neq(&Indentation(-1))
                 },
@@ -586,8 +1038,98 @@ impl Formatter {
             )
     }
 
+    /// Indent `with` expressions. For this input...
+    ///
+    /// ```text
+    /// rule foo {
+    /// condition:
+    ///   with
+    ///   foo = "foo"
+    ///   bar = "bar": (...)
+    /// }
+    /// ```
+    ///
+    /// ... the result is ...
+    ///
+    /// ```text
+    /// rule foo {
+    /// condition:
+    ///   with
+    ///     foo = "foo"
+    ///     bar = "bar": (...)
+    /// }
+    /// ```
+    fn indent_with_expr<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    where
+        I: TokenStream<'a> + 'a,
+    {
+        processor::Processor::new(input)
+            // Ignore all comments.
+            .set_passthrough(*COMMENT)
+            // Increase indentation after the `with` keyword.
+            .add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::WITH_EXPR, false)
+                        && ctx.token(-1).eq(&Keyword(b"with"))
+                },
+                processor::actions::insert(Indentation(1)),
+            )
+            // Decrease indentation after the `with` expression.
+            .add_rule(
+                |ctx| {
+                    ctx.token(1).eq(&End(SyntaxKind::WITH_EXPR))
+                        && ctx.token(-1).neq(&Indentation(-1))
+                },
+                processor::actions::insert(Indentation(-1)),
+            )
+    }
+
+    /// Indent hex patterns. For this input...
+    ///
+    /// ```text
+    ///   $a = {
+    ///   00 ..
+    ///   01 ..
+    ///   02
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// ... the result is ...
+    ///
+    /// ```text
+    ///   $a = {
+    ///     00 ..
+    ///     01 ..
+    ///     02
+    ///   }
+    /// }
+    /// ```
+    fn indent_hex_patterns<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    where
+        I: TokenStream<'a> + 'a,
+    {
+        processor::Processor::new(input)
+            .set_passthrough(*COMMENT)
+            .add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::HEX_PATTERN, true)
+                        && ctx.token(-1).eq(&LBRACE)
+                },
+                processor::actions::insert(Indentation(1)),
+            )
+            .add_rule(
+                |ctx| {
+                    ctx.in_rule(SyntaxKind::HEX_PATTERN, true)
+                        && ctx.token(1).eq(&RBRACE)
+                        && ctx.token(-1).neq(&Indentation(-1))
+                },
+                processor::actions::insert(Indentation(-1)),
+            )
+    }
+
     /// Aligns the equals signs in pattern definitions. For example, for this
-    /// input..
+    /// input:
     ///
     /// ```text
     /// rule foo {
@@ -621,43 +1163,62 @@ impl Formatter {
     ///   strings:
     ///     $short     = "foo"
     ///     $very_long = "bar"
-    ///    
+    ///
     ///     $even_longer    = "baz"
     ///     $longest_of_all = "qux"
     ///   condition:
     ///     true
     /// }
     /// ```
-    ///  
+    ///
     /// The patterns in the first block are aligned together, but they are not
     /// influenced by the longer lines in the second block.
     ///
-    /// The input must must contain at least one newline character after each
+    /// The input must contain at least one newline character after each
     /// pattern definition.
-    fn align_patterns<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    fn align_patterns_section<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    where
+        I: TokenStream<'a> + 'a,
+    {
+        Self::align(input, SyntaxKind::PATTERNS_BLK, SyntaxKind::PATTERN_DEF)
+    }
+
+    /// Aligns the equals signs in metadata definitions.
+    ///
+    /// This is similar to [`Formatter::align_patterns_section`] but for metadata.
+    fn align_meta_section<'a, I>(input: I) -> impl TokenStream<'a> + 'a
+    where
+        I: TokenStream<'a> + 'a,
+    {
+        Self::align(input, SyntaxKind::META_BLK, SyntaxKind::META_DEF)
+    }
+
+    fn align<'a, I>(
+        input: I,
+        block_kind: SyntaxKind,
+        item_kind: SyntaxKind,
+    ) -> impl TokenStream<'a> + 'a
     where
         I: TokenStream<'a> + 'a,
     {
         // First insert the alignment markers at the appropriate places...
         let input_with_markers = processor::Processor::new(input)
-            // Insert `AlignmentBlockBegin` after the start of the pattern
-            // definitions block.
+            // Insert `AlignmentBlockBegin` after the start of each block.
             .add_rule(
-                |ctx| ctx.token(-1).eq(&Begin(GrammarRule::pattern_defs)),
+                move |ctx| ctx.token(-1).eq(&Begin(block_kind)),
                 processor::actions::insert(AlignmentBlockBegin),
             )
-            // Insert `AlignmentBlockEnd` just before the end of the pattern
-            // definitions block.
+            // Insert `AlignmentBlockEnd` just before the end each block.
             .add_rule(
-                |ctx| {
-                    ctx.token(1).eq(&End(GrammarRule::pattern_defs))
+                move |ctx| {
+                    ctx.token(1).eq(&End(block_kind))
                         && ctx.token(-1).neq(&AlignmentBlockEnd)
                 },
                 processor::actions::insert(AlignmentBlockEnd),
             )
             .add_rule(
-                |ctx| {
-                    ctx.in_rule(GrammarRule::pattern_defs, false)
+                move |ctx| {
+                    ctx.in_rule(block_kind, false)
                         && ctx.token(-2).eq(&Newline)
                         && ctx.token(-1).eq(&Newline)
                 },
@@ -666,11 +1227,10 @@ impl Formatter {
                     ctx.push_output_token(Some(AlignmentBlockBegin));
                 },
             )
-            // Insert `AlignmentMarker` before each equal sign in a pattern
-            // definition.
+            // Insert `AlignmentMarker` before each equal sign.
             .add_rule(
-                |ctx| {
-                    ctx.in_rule(GrammarRule::pattern_def, false)
+                move |ctx| {
+                    ctx.in_rule(item_kind, false)
                         && ctx.token(1).eq(&EQUAL)
                         && ctx.token(-1).neq(&AlignmentMarker)
                 },
@@ -683,8 +1243,9 @@ impl Formatter {
         Align::new(input_with_markers)
     }
 
-    /// Aligns tail comments inside hex patterns
+    /// Aligns tail comments inside hex patterns. For this input...
     ///
+    /// ```text
     /// rule foo {
     ///   strings:
     ///     $hex = {
@@ -694,9 +1255,11 @@ impl Formatter {
     ///   condition:
     ///     true
     /// }
+    /// ```
     ///
     /// ... the result is ...
     ///
+    /// ```text
     /// rule foo {
     ///   strings:
     ///     $hex = {
@@ -706,6 +1269,7 @@ impl Formatter {
     ///   condition:
     ///     true
     /// }
+    /// ```
     ///
     fn align_comments_in_hex_patterns<'a, I>(
         input: I,
@@ -716,19 +1280,19 @@ impl Formatter {
         // First insert the alignment markers at the appropriate places...
         let input_with_markers = processor::Processor::new(input)
             .add_rule(
-                |ctx| ctx.token(-1).eq(&Begin(GrammarRule::hex_pattern)),
+                |ctx| ctx.token(-1).eq(&Begin(SyntaxKind::HEX_PATTERN)),
                 processor::actions::insert(AlignmentBlockBegin),
             )
             .add_rule(
                 |ctx| {
-                    ctx.token(1).eq(&End(GrammarRule::hex_pattern))
+                    ctx.token(1).eq(&End(SyntaxKind::HEX_PATTERN))
                         && ctx.token(-1).neq(&AlignmentBlockEnd)
                 },
                 processor::actions::insert(AlignmentBlockEnd),
             )
             .add_rule(
                 |ctx| {
-                    ctx.in_rule(GrammarRule::hex_pattern, true)
+                    ctx.in_rule(SyntaxKind::HEX_PATTERN, true)
                         && matches!(ctx.token(1), Token::TailComment(_))
                         && ctx.token(-1).neq(&AlignmentMarker)
                 },
@@ -753,9 +1317,10 @@ impl Formatter {
             // - No space after "(" and "["
             // - No space before ")" and "]"
             // - No space before ":"
+            // - No space before ","
             // - No space before or after ".." (e.g: (0..10))
             // - No space before or after "." (e.g: foo.bar)
-            // - No space in-between identifiers and "(" or "[" (e.g: array[0], 
+            // - No space in-between identifiers and "(" or "[" (e.g: array[0],
             //   func("foo")).
             // - No space before or after "-" in pattern modifiers and hex jumps
             //   (e.g: xor(0-255), [0-10]).
@@ -772,9 +1337,9 @@ impl Formatter {
                     let drop_space =
                         // Don't insert space if next token is ":"
                         next_token.eq(&COLON)
-                        // Don't insert spaces around ".."
-                        || prev_token.eq(&DOT_DOT)
-                        || next_token.eq(&DOT_DOT)
+                        || next_token.eq(&COMMA)
+                        // Don't insert space after "-"
+                        || prev_token.eq(&HYPHEN)
                         // Don't insert spaces around "."
                         || prev_token.eq(&DOT)
                         || next_token.eq(&DOT)
@@ -782,13 +1347,17 @@ impl Formatter {
                         // or "[".
                         || prev_token.is(*IDENTIFIER)
                             && next_token.is(*LGROUPING)
+                        // don't insert space in-between some identifier and "*"
+                        // like in $a*
+                        || prev_token.is(*IDENTIFIER)
+                            && next_token.eq(&ASTERISK)
                         // don't insert spaces before "(" in pattern modifiers.
-                        || ctx.in_rule(GrammarRule::pattern_mods, false)
+                        || ctx.in_rule(SyntaxKind::PATTERN_MOD, false)
                             && next_token.is(*LGROUPING)
-                        // don't insert spaces before or after "-" in pattern 
+                        // don't insert spaces before or after "-" in pattern
                         // modifiers and hex jumps.
-                        || (ctx.in_rule(GrammarRule::pattern_mods, false) ||
-                            ctx.in_rule(GrammarRule::hex_jump, false))
+                        || (ctx.in_rule(SyntaxKind::PATTERN_MOD, false) ||
+                            ctx.in_rule(SyntaxKind::HEX_JUMP, false))
                             && (next_token.eq(&HYPHEN) || prev_token.eq(&HYPHEN));
 
                     add_space && !drop_space

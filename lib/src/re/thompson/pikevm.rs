@@ -3,7 +3,7 @@ use std::mem;
 
 use bitvec::array::BitArray;
 
-use super::instr::{Instr, InstrParser};
+use super::instr::{Instr, InstrParser, Offset};
 use crate::re::bitmapset::BitmapSet;
 use crate::re::thompson::instr::SplitId;
 use crate::re::{Action, CodeLoc, WideIter, DEFAULT_SCAN_LIMIT};
@@ -17,10 +17,10 @@ pub(crate) struct PikeVM<'r> {
     /// position within the VM code, pointing to some VM instruction. Each item
     /// in the set is unique, the VM guarantees that there aren't two active
     /// threads at the same VM instruction.
-    threads: BitmapSet,
+    threads: BitmapSet<u32>,
     /// The set of threads that will become the active threads when the next
     /// byte is read from the input.
-    next_threads: BitmapSet,
+    next_threads: BitmapSet<u32>,
     /// Maximum number of bytes to scan. The VM will abort after ingesting
     /// this number of bytes from the input.
     scan_limit: u16,
@@ -174,6 +174,7 @@ impl<'r> PikeVM<'r> {
         epsilon_closure(
             self.code,
             start,
+            0,
             curr_byte,
             bck_input.next(),
             &mut self.cache,
@@ -183,8 +184,8 @@ impl<'r> PikeVM<'r> {
         while !self.threads.is_empty() {
             let next_byte = fwd_input.next();
 
-            for ip in self.threads.iter() {
-                let (instr, size) = InstrParser::decode_instr(unsafe {
+            for (ip, rep_count) in self.threads.iter() {
+                let (instr, instr_size) = InstrParser::decode_instr(unsafe {
                     self.code.get_unchecked(*ip..)
                 });
 
@@ -215,7 +216,8 @@ impl<'r> PikeVM<'r> {
                 if is_match {
                     epsilon_closure(
                         self.code,
-                        C::from(*ip + size),
+                        C::from(*ip + instr_size),
+                        *rep_count,
                         next_byte,
                         curr_byte,
                         &mut self.cache,
@@ -242,11 +244,14 @@ impl<'r> PikeVM<'r> {
 /// its state during the computation of an epsilon closure. See the
 /// documentation of [`epsilon_closure`] for details.
 pub struct EpsilonClosureState {
-    threads: Vec<usize>,
+    /// Pairs (instruction pointer, repetition count) describing the existing
+    /// threads.
+    threads: Vec<(usize, u32)>,
     /// This bit array has one bit per possible value of SplitId. If the
     /// split instruction with SplitId = N is executed, the N-th bit in the
     /// array is set to 1.
-    executed_splits: BitArray<[u64; (1 << SplitId::BITS) / 64]>,
+    executed_splits:
+        BitArray<[usize; SplitId::MAX.div_ceil(usize::BITS as usize)]>,
     /// Indicates whether the `executed_splits` bit array needs to be
     /// cleared during the next call to [`EpsilonClosureState::executed`].
     dirty: bool,
@@ -308,20 +313,24 @@ impl EpsilonClosureState {
 pub(crate) fn epsilon_closure<C: CodeLoc>(
     code: &[u8],
     start: C,
+    rep_count: u32,
     curr_byte: Option<&u8>,
     prev_byte: Option<&u8>,
     state: &mut EpsilonClosureState,
-    closure: &mut BitmapSet,
+    closure: &mut BitmapSet<u32>,
 ) {
-    state.threads.push(start.location());
+    state.threads.push((start.location(), rep_count));
     state.dirty = true;
 
     let is_word_char = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
 
-    while let Some(ip) = state.threads.pop() {
-        let (instr, size) =
+    let apply_offset = |ip: usize, offset: Offset| -> usize {
+        (ip as isize).saturating_add(offset.into()).try_into().unwrap()
+    };
+
+    while let Some((ip, mut rep_count)) = state.threads.pop() {
+        let (instr, instr_size) =
             InstrParser::decode_instr(unsafe { code.get_unchecked(ip..) });
-        let next = ip + size;
         match instr {
             Instr::AnyByte
             | Instr::Byte(_)
@@ -330,54 +339,188 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
             | Instr::ClassBitmap(_)
             | Instr::ClassRanges(_)
             | Instr::Match => {
-                closure.insert(ip);
+                closure.insert(ip, rep_count);
             }
             Instr::SplitA(id, offset) => {
                 if !state.executed(id) {
-                    state
-                        .threads
-                        .push((ip as i64 + offset as i64).try_into().unwrap());
-                    state.threads.push(next);
+                    state.threads.push((apply_offset(ip, offset), rep_count));
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
             Instr::SplitB(id, offset) => {
                 if !state.executed(id) {
-                    state.threads.push(next);
-                    state
-                        .threads
-                        .push((ip as i64 + offset as i64).try_into().unwrap());
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
+                    state.threads.push((apply_offset(ip, offset), rep_count));
                 }
             }
             Instr::SplitN(split) => {
                 if !state.executed(split.id()) {
                     for offset in split.offsets().rev() {
-                        state.threads.push(
-                            (ip as i64 + offset as i64).try_into().unwrap(),
-                        );
+                        state
+                            .threads
+                            .push((apply_offset(ip, offset), rep_count));
                     }
+                }
+            }
+            Instr::RepeatGreedy { offset, min, max } => {
+                rep_count += 1;
+                if rep_count >= min {
+                    state
+                        .threads
+                        .push((apply_offset(ip, instr_size.into()), 0));
+                }
+                if rep_count < max {
+                    state.threads.push((apply_offset(ip, offset), rep_count));
+                }
+            }
+            Instr::RepeatNonGreedy { offset, min, max } => {
+                rep_count += 1;
+                if rep_count < max {
+                    state.threads.push((apply_offset(ip, offset), rep_count));
+                }
+                if rep_count >= min {
+                    state
+                        .threads
+                        .push((apply_offset(ip, instr_size.into()), 0));
                 }
             }
             Instr::Jump(offset) => {
-                state
-                    .threads
-                    .push((ip as i64 + offset as i64).try_into().unwrap());
+                state.threads.push((apply_offset(ip, offset), rep_count));
             }
             Instr::Start => {
-                if start.backwards() {
-                    if curr_byte.is_none() {
-                        state.threads.push(next);
-                    }
-                } else if prev_byte.is_none() {
-                    state.threads.push(next);
+                let is_match = match (start.backwards(), prev_byte, curr_byte)
+                {
+                    // Going forward, no previous byte, we are at the start of
+                    // the input, this is a match.
+                    (false, None, _) => true,
+                    // Going backward, no current byte, we are at the start
+                    // of the input, this is a match.
+                    (true, _, None) => true,
+                    _ => false,
+                };
+                if is_match {
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
             Instr::End => {
-                if start.backwards() {
-                    if prev_byte.is_none() {
-                        state.threads.push(next);
+                let is_match = match (start.backwards(), prev_byte, curr_byte)
+                {
+                    // Going forward, no current byte, we are at the end of the
+                    // data, this is a match.
+                    (false, _, None) => true,
+                    // Going backward, no previous byte, we are at the end of
+                    // the data, this is a match.
+                    (true, None, _) => true,
+                    _ => false,
+                };
+                if is_match {
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
+                }
+            }
+            Instr::LineStart => {
+                let is_match = match (start.backwards(), prev_byte, curr_byte)
+                {
+                    // Going forward, no previous byte, we are at the start of
+                    // the input, this is a match.
+                    (false, None, _) => true,
+                    // Going forward, no current byte, previous byte was \n,
+                    // this is a match.
+                    (false, Some(b'\n'), None) => true,
+                    // Going forward, no current byte, previous byte was \r,
+                    // this is a match.
+                    (false, Some(b'\r'), None) => true,
+                    // Going forward, previous byte was \n, this is match if
+                    // current byte is not \r.
+                    (false, Some(b'\n'), Some(curr_byte)) => {
+                        *curr_byte != b'\r'
                     }
-                } else if curr_byte.is_none() {
-                    state.threads.push(next);
+                    // Going forward, previous byte was \r, this is match if
+                    // current byte is not \n.
+                    (false, Some(b'\r'), Some(curr_byte)) => {
+                        *curr_byte != b'\n'
+                    }
+                    // Going backward, no current byte, we are at the start
+                    // of the input, this is a match.
+                    (true, _, None) => true,
+                    // Going backward, no previous byte and current byte is \n,
+                    // this is a match.
+                    (true, None, Some(b'\n')) => true,
+                    // Going backward, no previous byte and current byte is \r,
+                    // this is a match.
+                    (true, None, Some(b'\r')) => true,
+                    // Going backward, current byte is \n, this is a match if
+                    // previous byte was not \r.
+                    (true, Some(prev_byte), Some(b'\n')) => {
+                        *prev_byte != b'\r'
+                    }
+                    // Going backward, current byte is \r, this is a match if
+                    // previous byte was not \n.
+                    (true, Some(prev_byte), Some(b'\r')) => {
+                        *prev_byte != b'\n'
+                    }
+                    _ => false,
+                };
+                if is_match {
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
+                }
+            }
+            Instr::LineEnd => {
+                let is_match = match (start.backwards(), prev_byte, curr_byte)
+                {
+                    // Going forward, no current byte, we are at the end of the
+                    // data, this is a match.
+                    (false, _, None) => true,
+                    // Going forward, no previous byte and current byte is \n,
+                    // this is a match.
+                    (false, None, Some(b'\n')) => true,
+                    // Going forward, no previous byte and current byte is \t,
+                    // this is a match.
+                    (false, None, Some(b'\t')) => true,
+                    // Going forward, current byte is \n, this is a match if
+                    // the previous byte is not \r.
+                    (false, Some(prev_byte), Some(b'\n')) => {
+                        *prev_byte != b'\r'
+                    }
+                    // Going forward, current byte is \r, this is a match if
+                    // the previous byte is not \n.
+                    (false, Some(prev_byte), Some(b'\r')) => {
+                        *prev_byte != b'\n'
+                    }
+                    // Going backward, no previous byte, we are at the end of
+                    // the data, this is a match.
+                    (true, None, _) => true,
+                    // Going backward, previous byte is \n, this is a match if
+                    // the current byte is not \r.
+                    (true, Some(b'\n'), Some(curr_byte)) => {
+                        *curr_byte != b'\r'
+                    }
+                    // Going backward, previous byte is \r, this is a match if
+                    // the current byte is not \n.
+                    (true, Some(b'\r'), Some(curr_byte)) => {
+                        *curr_byte != b'\n'
+                    }
+                    _ => false,
+                };
+                if is_match {
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
             Instr::WordStart => {
@@ -392,7 +535,10 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
                     _ => false,
                 };
                 if is_match {
-                    state.threads.push(next)
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
             Instr::WordEnd => {
@@ -407,7 +553,10 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
                     _ => false,
                 };
                 if is_match {
-                    state.threads.push(next)
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
             Instr::WordBoundary | Instr::WordBoundaryNeg => {
@@ -422,7 +571,10 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
                 }
 
                 if is_match {
-                    state.threads.push(next)
+                    state.threads.push((
+                        apply_offset(ip, instr_size.into()),
+                        rep_count,
+                    ));
                 }
             }
         }

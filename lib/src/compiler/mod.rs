@@ -7,39 +7,44 @@ module implements the YARA compiler.
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
-use std::ops::RangeInclusive;
+use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
 #[cfg(feature = "logging")]
 use std::time::Instant;
-use std::{fmt, iter, u32};
+use std::{fmt, iter};
 
 use bincode::Options;
-use bitmask::bitmask;
-use bstr::ByteSlice;
-use itertools::izip;
+use bitflags::bitflags;
+use bstr::{BStr, ByteSlice};
+use itertools::{izip, Itertools, MinMaxResult};
 #[cfg(feature = "logging")]
 use log::*;
 use regex_syntax::hir;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use walrus::FunctionId;
 
 use yara_x_parser::ast;
-use yara_x_parser::ast::{HasSpan, Ident, Import, RuleFlag, Span};
-use yara_x_parser::report::ReportBuilder;
-use yara_x_parser::warnings::{Warning, Warnings};
-use yara_x_parser::{Parser, SourceCode};
+use yara_x_parser::ast::{Ident, Import, RuleFlags, WithSpan};
+use yara_x_parser::{Parser, Span};
 
 use crate::compiler::base64::base64_patterns;
 use crate::compiler::emit::{emit_rule_condition, EmitContext};
+use crate::compiler::errors::{
+    CompileError, ConflictingRuleIdentifier, CustomError, DuplicateRule,
+    DuplicateTag, EmitWasmError, InvalidRegexp, InvalidUTF8, UnknownModule,
+    UnusedPattern,
+};
+use crate::compiler::report::{CodeLoc, ReportBuilder};
 use crate::compiler::{CompileContext, VarStack};
 use crate::modules::BUILTIN_MODULES;
+use crate::re;
+use crate::re::hir::{ChainedPattern, ChainedPatternGap};
 use crate::string_pool::{BStringPool, StringPool};
-use crate::symbols::{
-    StackedSymbolTable, Symbol, SymbolKind, SymbolLookup, SymbolTable,
-};
-use crate::types::{Func, Struct, TypeValue, Value};
+use crate::symbols::{StackedSymbolTable, Symbol, SymbolLookup, SymbolTable};
+use crate::types::{Func, Struct, TypeValue};
 use crate::utils::cast;
 use crate::variables::{is_valid_identifier, Variable, VariableError};
 use crate::wasm::builder::WasmModuleBuilder;
@@ -48,25 +53,121 @@ use crate::wasm::{WasmExport, WasmSymbols, WASM_EXPORTS};
 pub(crate) use crate::compiler::atoms::*;
 pub(crate) use crate::compiler::context::*;
 pub(crate) use crate::compiler::ir::*;
-
-#[doc(inline)]
-pub use crate::compiler::errors::*;
-
 #[doc(inline)]
 pub use crate::compiler::rules::*;
-use crate::re;
-use crate::re::hir::ChainedPattern;
+
+#[doc(inline)]
+pub use crate::compiler::warnings::*;
+use crate::linters::LinterResult;
+use crate::models::PatternKind;
 
 mod atoms;
 mod context;
 mod emit;
-mod errors;
 mod ir;
+mod report;
 mod rules;
 
-pub mod base64;
 #[cfg(test)]
 mod tests;
+
+pub mod base64;
+pub mod errors;
+pub mod linters;
+pub mod warnings;
+
+/// A structure that describes some YARA source code.
+///
+/// This structure contains a `&str` pointing to the code itself, and an
+/// optional `origin` that tells where the source code came from. The
+/// most common use for `origin` is indicating the path of the file from
+/// where the source code was obtained, but it can contain any arbitrary
+/// string. This string, if provided, will appear in error messages. For
+/// example, in this error message `origin` was set to `some_file.yar`:
+///
+/// ```text
+/// error: syntax error
+///  --> some_file.yar:4:17
+///   |
+/// 4 | ... more details
+/// ```
+///
+/// # Example
+///
+/// ```
+/// use yara_x::SourceCode;
+/// let src = SourceCode::from("rule test { condition: true }").with_origin("some_file.yar");
+/// ```
+///
+#[derive(Debug, Clone)]
+pub struct SourceCode<'src> {
+    /// A reference to the source code itself. This is a BStr because the
+    /// source code could contain non-UTF8 content.
+    pub(crate) raw: &'src BStr,
+    /// A reference to the source code after validating that it is valid
+    /// UTF-8.
+    pub(crate) valid: Option<&'src str>,
+    /// An optional string that tells which is the origin of the code. Usually
+    /// a file path.
+    pub(crate) origin: Option<String>,
+}
+
+impl<'src> SourceCode<'src> {
+    /// Sets a string that describes the origin of the source code.
+    ///
+    /// This is usually the path of the file that contained the source code,
+    /// but it can be an arbitrary string. The origin appears in error and
+    /// warning messages.
+    pub fn with_origin(self, origin: &str) -> Self {
+        Self {
+            raw: self.raw,
+            valid: self.valid,
+            origin: Some(origin.to_owned()),
+        }
+    }
+
+    /// Returns the source code as a `&str`.
+    ///
+    /// If the source code is not valid UTF-8 it will return an error.
+    fn as_str(&mut self) -> Result<&'src str, bstr::Utf8Error> {
+        match self.valid {
+            // We already know that source code is valid UTF-8, return it
+            // as is.
+            Some(s) => Ok(s),
+            // We don't know yet if the source code is valid UTF-8, some
+            // validation must be done. If validation fails an error is
+            // returned.
+            None => {
+                let src = self.raw.to_str()?;
+                self.valid = Some(src);
+                Ok(src)
+            }
+        }
+    }
+}
+
+impl<'src> From<&'src str> for SourceCode<'src> {
+    /// Creates a new [`SourceCode`] from a `&str`.
+    fn from(src: &'src str) -> Self {
+        // The input is a &str, therefore it's guaranteed to be valid UTF-8
+        // and the `valid` field can be initialized.
+        Self { raw: BStr::new(src), valid: Some(src), origin: None }
+    }
+}
+
+impl<'src> From<&'src [u8]> for SourceCode<'src> {
+    /// Creates a new [`SourceCode`] from a `&[u8]`.
+    ///
+    /// As `src` is not guaranteed to be a valid UTF-8 string, the parser will
+    /// verify it and return an error if invalid UTF-8 characters are found.
+    fn from(src: &'src [u8]) -> Self {
+        // The input is a &[u8], its content is not guaranteed to be valid
+        // UTF-8 so the `valid` field is set to `None`. The `validate_utf8`
+        // function will be called for validating the source code before
+        // being parsed.
+        Self { raw: BStr::new(src), valid: None, origin: None }
+    }
+}
 
 /// Compiles a YARA source code.
 ///
@@ -83,7 +184,7 @@ mod tests;
 /// let results = scanner.scan("Lorem ipsum".as_bytes()).unwrap();
 /// assert_eq!(results.matching_rules().len(), 1);
 /// ```
-pub fn compile<'src, S>(src: S) -> Result<Rules, Error>
+pub fn compile<'src, S>(src: S) -> Result<Rules, CompileError>
 where
     S: Into<SourceCode<'src>>,
 {
@@ -138,6 +239,24 @@ pub struct Compiler<'a> {
     /// escape sequences.
     relaxed_re_syntax: bool,
 
+    /// If true, the compiler applies common subexpression elimination to
+    /// rule conditions.
+    cse: bool,
+
+    /// If true, the compiler hoists loop-invariant expressions (i.e: those
+    /// that don't vary on each iteration of the loop), moving them outside
+    /// the loop.
+    hoisting: bool,
+
+    /// If true, slow patterns produce an error instead of a warning. A slow
+    /// pattern is one with atoms shorter than 2 bytes.
+    error_on_slow_pattern: bool,
+
+    /// If true, a slow loop produces an error instead of a warning. A slow
+    /// rule is one where the upper bound of the loop is potentially large.
+    /// Like for example: `for all x in (0..filesize) : (...)`
+    error_on_slow_loop: bool,
+
     /// Used for generating error and warning reports.
     report_builder: ReportBuilder,
 
@@ -161,7 +280,7 @@ pub struct Compiler<'a> {
     /// Pool that contains all the identifiers used in the rules. Each
     /// identifier appears only once, even if they are used by multiple
     /// rules. For example, the pool contains a single copy of the common
-    /// identifier `$a`. Each identifier have an unique 32-bits [`IdentId`]
+    /// identifier `$a`. Each identifier have a unique 32-bits [`IdentId`]
     /// that can be used for retrieving the identifier from the pool.
     ident_pool: StringPool<IdentId>,
 
@@ -175,6 +294,11 @@ pub struct Compiler<'a> {
     /// only accepts valid UTF-8. This pool also stores the atoms extracted
     /// from patterns.
     lit_pool: BStringPool<LiteralId>,
+
+    /// Intermediate representation (IR) tree for condition of the rule that
+    /// is currently being compiled. After compiling each rule the tree is
+    /// cleared, but it will be reused for the next rule.
+    ir: IR,
 
     /// Builder for creating the WebAssembly module that contains the code
     /// for all rule conditions.
@@ -222,7 +346,7 @@ pub struct Compiler<'a> {
     atoms: Vec<SubPatternAtom>,
 
     /// A vector that contains the code for all regexp patterns (this includes
-    /// hex patterns which are just an special case of regexp). The code for
+    /// hex patterns which are just a special case of regexp). The code for
     /// each regexp is appended to the vector, during the compilation process
     /// and the atoms extracted from the regexp contain offsets within this
     /// vector. This vector contains both forward and backward code.
@@ -237,7 +361,12 @@ pub struct Compiler<'a> {
     /// without causing an error, but a warning is raised to let the user know
     /// that the module is not supported. Any rule that depends on an unsupported
     /// module is ignored.
-    ignored_modules: Vec<String>,
+    ignored_modules: FxHashSet<String>,
+
+    /// Keys in this map are the modules that are banned, and values are a pair
+    /// of strings with the title and message for the error that will be shown
+    /// if the banned module is imported.
+    banned_modules: FxHashMap<String, (String, String)>,
 
     /// Keys in this map are the name of rules that will be ignored because they
     /// depend on unsupported modules, either directly or indirectly. Values are
@@ -251,6 +380,21 @@ pub struct Compiler<'a> {
 
     /// Warnings generated while compiling the rules.
     warnings: Warnings,
+
+    /// Errors generated while compiling the rules.
+    errors: Vec<CompileError>,
+
+    /// Features enabled for this compiler. See [`Compiler::enable_feature`]
+    /// for details.
+    features: FxHashSet<String>,
+
+    /// Optional writer where the compiler writes the IR produced by each rule.
+    /// This is used for test cases and debugging.
+    ir_writer: Option<Box<dyn Write>>,
+
+    /// Linters applied to each rule during compilation. The linters are added
+    /// to the compiler using [`Compiler::add_linter`]:
+    linters: Vec<Box<dyn linters::Linter + 'a>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -268,11 +412,7 @@ impl<'a> Compiler<'a> {
             .filter(|e| e.public && e.builtin())
         {
             let func = Rc::new(Func::from_mangled_name(export.mangled_name));
-
-            let symbol = Symbol::new(
-                TypeValue::Func(func.clone()),
-                SymbolKind::Func(func),
-            );
+            let symbol = Symbol::Func(func);
 
             global_symbols.borrow_mut().insert(export.name, symbol);
         }
@@ -302,7 +442,14 @@ impl<'a> Compiler<'a> {
         let wasm_symbols = wasm_mod.wasm_symbols();
         let wasm_exports = wasm_mod.wasm_exports();
 
+        let mut ir = IR::new();
+
+        if cfg!(feature = "constant-folding") {
+            ir.constant_folding(true);
+        }
+
         Self {
+            ir,
             ident_pool,
             global_symbols,
             symbol_table,
@@ -310,41 +457,98 @@ impl<'a> Compiler<'a> {
             wasm_symbols,
             wasm_exports,
             relaxed_re_syntax: false,
+            cse: false,
+            hoisting: false,
+            error_on_slow_pattern: false,
+            error_on_slow_loop: false,
             next_pattern_id: PatternId(0),
             current_pattern_id: PatternId(0),
             current_namespace: default_namespace,
+            features: FxHashSet::default(),
             warnings: Warnings::default(),
+            errors: Vec::new(),
             rules: Vec::new(),
             sub_patterns: Vec::new(),
             anchored_sub_patterns: Vec::new(),
             atoms: Vec::new(),
             re_code: Vec::new(),
             imported_modules: Vec::new(),
-            ignored_modules: Vec::new(),
+            ignored_modules: FxHashSet::default(),
+            banned_modules: FxHashMap::default(),
             ignored_rules: FxHashMap::default(),
             root_struct: Struct::new().make_root(),
             report_builder: ReportBuilder::new(),
             lit_pool: BStringPool::new(),
             regexp_pool: StringPool::new(),
             patterns: FxHashMap::default(),
+            ir_writer: None,
+            linters: Vec::new(),
         }
     }
 
-    /// Adds a YARA source code to be compiled.
+    /// Adds some YARA source code to be compiled.
     ///
-    /// This function can be called multiple times.
-    pub fn add_source<'src, S>(&mut self, src: S) -> Result<&mut Self, Error>
+    /// The `src` parameter accepts any type that implements [`Into<SourceCode>`],
+    /// such as `&str`, `&[u8]`, and naturally, [`SourceCode`] itself. This input
+    /// can include one or more YARA rules.
+    ///
+    /// This function may be invoked multiple times to add several sets of YARA
+    /// rules. If the rules provided in `src` contain errors that prevent
+    /// compilation, the function will return the first error encountered.
+    /// Additionally, the compiler will store this error, along with any others
+    /// discovered during compilation, which can be accessed using
+    /// [`Compiler::errors`].
+    ///
+    /// Even if a previous invocation resulted in a compilation error, you can
+    /// continue calling this function for adding more rules. In such cases, any
+    /// rules that failed to compile will not be included in the final compiled
+    /// set.
+    pub fn add_source<'src, S>(
+        &mut self,
+        src: S,
+    ) -> Result<&mut Self, CompileError>
     where
         S: Into<SourceCode<'src>>,
     {
         // Convert `src` into an instance of `SourceCode` if it is something
         // else, like a &str.
-        let src = src.into();
+        let mut src = src.into();
 
-        // Parse the source code and build the Abstract Syntax Tree.
-        let ast = Parser::new()
-            .set_report_builder(&self.report_builder)
-            .build_ast(src)?;
+        // Register source code, even before validating that it is UTF-8. In
+        // case of UTF-8 encoding errors we want to report that error too,
+        // and we need the source code registered for creating the report.
+        self.report_builder.register_source(&src);
+
+        // Make sure that the source code is valid UTF-8, or return an error
+        // if otherwise.
+        let ast = match src.as_str() {
+            Ok(src) => {
+                // Parse the source code and build the Abstract Syntax Tree.
+                Parser::new(src.as_bytes()).into_ast()
+            }
+            Err(err) => {
+                let span_start = err.valid_up_to();
+                let span_end = if let Some(error_len) = err.error_len() {
+                    // `error_len` is the number of invalid UTF-8 bytes found
+                    // after `span_start`. Round the number up to the next 3
+                    // bytes boundary because invalid bytes are replaced with
+                    // the Unicode replacement characters that takes 3 bytes.
+                    // This way the span ends at a valid UTF-8 character
+                    // boundary.
+                    span_start + error_len.next_multiple_of(3)
+                } else {
+                    span_start
+                };
+                return Err(InvalidUTF8::build(
+                    &self.report_builder,
+                    Span(span_start as u32..span_end as u32).into(),
+                ));
+            }
+        };
+
+        // Store the current length of the `errors` vector, so that we can
+        // know if more errors were added.
+        let existing_errors = self.errors.len();
 
         let mut already_imported = FxHashMap::default();
 
@@ -354,38 +558,49 @@ impl<'a> Compiler<'a> {
         // symbol to the current namespace.
         for import in &ast.imports {
             if let Some(span) =
-                already_imported.insert(&import.module_name, import.span)
+                already_imported.insert(&import.module_name, import.span())
             {
                 self.warnings.add(|| {
-                    Warning::duplicate_import(
+                    warnings::DuplicateImport::build(
                         &self.report_builder,
-                        import.module_name.clone(),
-                        import.span,
-                        span,
+                        import.module_name.to_string(),
+                        import.span().into(),
+                        span.into(),
                     )
                 })
             }
-
             // Import the module. This updates `self.root_struct` if
             // necessary.
-            self.c_import(import)?;
+            if let Err(err) = self.c_import(import) {
+                self.errors.push(err);
+            }
         }
 
         // Iterate over the list of declared rules and verify that their
         // conditions are semantically valid. For each rule add a symbol
         // to the current namespace.
-        for rule in &ast.rules {
-            self.c_rule(rule)?;
+        for rule in ast.rules() {
+            if let Err(err) = self.c_rule(rule) {
+                self.errors.push(err);
+            }
         }
 
-        // Transfer the warnings generated by the parser to the compiler
-        self.warnings.append(ast.warnings);
+        self.errors.extend(
+            ast.into_errors()
+                .into_iter()
+                .map(|err| CompileError::from(&self.report_builder, err)),
+        );
+
+        // More errors were added? Return the first error that was added.
+        if self.errors.len() > existing_errors {
+            return Err(self.errors[existing_errors].clone());
+        }
 
         Ok(self)
     }
 
-    /// Defines a global variable and sets its initial value.    
-    ///   
+    /// Defines a global variable and sets its initial value.
+    ///
     /// Global variables must be defined before using [`Compiler::add_source`]
     /// for adding any YARA source code that uses those variables. The variable
     /// will retain its initial value when the compiled [`Rules`] are used for
@@ -409,21 +624,19 @@ impl<'a> Compiler<'a> {
         &mut self,
         ident: &str,
         value: T,
-    ) -> Result<&mut Self, Error>
+    ) -> Result<&mut Self, VariableError>
     where
-        Error: From<<T as TryInto<Variable>>::Error>,
+        VariableError: From<<T as TryInto<Variable>>::Error>,
     {
         if !is_valid_identifier(ident) {
-            return Err(
-                VariableError::InvalidIdentifier(ident.to_string()).into()
-            );
+            return Err(VariableError::InvalidIdentifier(ident.to_string()));
         }
 
         let var: Variable = value.try_into()?;
         let type_value: TypeValue = var.into();
 
         if self.root_struct.add_field(ident, type_value).is_some() {
-            return Err(VariableError::AlreadyExists(ident.to_string()).into());
+            return Err(VariableError::AlreadyExists(ident.to_string()));
         }
 
         self.global_symbols
@@ -436,7 +649,8 @@ impl<'a> Compiler<'a> {
     /// Creates a new namespace.
     ///
     /// Further calls to [`Compiler::add_source`] will put the rules under the
-    /// newly created namespace.
+    /// newly created namespace. If the current namespace is already named as
+    /// the current one, no new namespace is created.
     ///
     /// In the example below both rules `foo` and `bar` are put into the same
     /// namespace (the default namespace), therefore `bar` can use `foo` as
@@ -468,7 +682,16 @@ impl<'a> Compiler<'a> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn new_namespace(&mut self, namespace: &str) -> &mut Self {
-        // Remove the symbol table corresponding to the previous namespace.
+        let current_namespace = self
+            .ident_pool
+            .get(self.current_namespace.ident_id)
+            .expect("expecting a namespace");
+        // If the current namespace is already named as the new namespace
+        // this function has no effect.
+        if namespace == current_namespace {
+            return self;
+        }
+        // Remove the symbol table corresponding to the current namespace.
         self.symbol_table.pop().expect("expecting a namespace");
         // Create a new namespace. The NamespaceId is simply the ID of the
         // previous namespace + 1.
@@ -523,8 +746,9 @@ impl<'a> Compiler<'a> {
 
         let mut rules = Rules {
             serialized_globals,
+            wasm_mod,
+            compiled_wasm_mod: Some(compiled_wasm_mod),
             relaxed_re_syntax: self.relaxed_re_syntax,
-            wasm_mod: compiled_wasm_mod,
             ac: None,
             num_patterns: self.next_pattern_id.0 as usize,
             ident_pool: self.ident_pool,
@@ -540,8 +764,76 @@ impl<'a> Compiler<'a> {
         };
 
         rules.build_ac_automaton();
-
         rules
+    }
+
+    /// Adds a linter to the compiler.
+    ///
+    /// Linters perform additional checks to each YARA rule, generating
+    /// warnings when a rule does not meet the linter's requirements. See
+    /// [`crate::linters`] for a list of available linters.
+    pub fn add_linter<L: linters::Linter + 'a>(
+        &mut self,
+        linter: L,
+    ) -> &mut Self {
+        self.linters.push(Box::new(linter));
+        self
+    }
+
+    /// Enables a feature on this compiler.
+    ///
+    /// When defining the structure of a module in a `.proto` file, you can
+    /// specify that certain fields are accessible only when one or more
+    /// features are enabled. For example, the snippet below shows the
+    /// definition of a field named `requires_foo_and_bar`, which can be
+    /// accessed only when both features "foo" and "bar" are enabled.
+    ///
+    /// ```protobuf
+    /// optional uint64 requires_foo_and_bar = 500 [
+    ///   (yara.field_options) = {
+    ///     acl: [
+    ///       {
+    ///         allow_if: "foo",
+    ///         error_title: "foo is required",
+    ///         error_label: "this field was used without foo"
+    ///       },
+    ///       {
+    ///         allow_if: "bar",
+    ///         error_title: "bar is required",
+    ///         error_label: "this field was used without bar"
+    ///       }
+    ///     ]
+    ///   }
+    /// ];
+    /// ```
+    ///
+    /// If some of the required features are not enabled, using this field in
+    /// a YARA rule will cause an error while compiling the rules. The error
+    /// looks like:
+    ///
+    /// ```text
+    /// error[E034]: foo is required
+    ///  --> line:5:29
+    ///   |
+    /// 5 |  test_proto2.requires_foo_and_bar == 0
+    ///   |              ^^^^^^^^^^^^^^^^^^^^ this field was used without foo
+    ///   |
+    /// ```
+    ///
+    /// Notice that both the title and label in the error message are defined
+    /// in the .proto file.
+    ///
+    /// # Important
+    ///
+    /// This API is hidden from the public documentation because it is unstable
+    /// and subject to change.
+    #[doc(hidden)]
+    pub fn enable_feature<F: Into<String>>(
+        &mut self,
+        feature: F,
+    ) -> &mut Self {
+        self.features.insert(feature.into());
+        self
     }
 
     /// Tell the compiler that a YARA module is not supported.
@@ -551,16 +843,66 @@ impl<'a> Compiler<'a> {
     /// ignored module will be ignored, while the rest of rules that
     /// don't rely on that module will be correctly compiled.
     pub fn ignore_module<M: Into<String>>(&mut self, module: M) -> &mut Self {
-        self.ignored_modules.push(module.into());
+        self.ignored_modules.insert(module.into());
+        self
+    }
+
+    /// Tell the compiler that a YARA module can't be used.
+    ///
+    /// Import statements for the banned module will cause an error. The error
+    /// message can be customized by using the given error title and message.
+    ///
+    /// If this function is called multiple times with the same module name,
+    /// the error title and message will be updated.
+    pub fn ban_module<M: Into<String>, T: Into<String>, E: Into<String>>(
+        &mut self,
+        module: M,
+        error_title: T,
+        error_message: E,
+    ) -> &mut Self {
+        self.banned_modules
+            .insert(module.into(), (error_title.into(), error_message.into()));
         self
     }
 
     /// Specifies whether the compiler should produce colorful error messages.
     ///
     /// Colorized error messages contain ANSI escape sequences that make them
-    /// look nicer on compatible consoles. The default setting is `false`.
+    /// look nicer on compatible consoles.
+    ///
+    /// The default setting is `false`.
     pub fn colorize_errors(&mut self, yes: bool) -> &mut Self {
         self.report_builder.with_colors(yes);
+        self
+    }
+
+    /// Sets the maximum number of columns in error messages.
+    ///
+    /// The default value is 140.
+    pub fn errors_max_with(&mut self, with: usize) -> &mut Self {
+        self.report_builder.max_with(with);
+        self
+    }
+
+    /// Enables or disables a specific type of warning.
+    ///
+    /// Each warning type has a description code (i.e: `slow_pattern`,
+    /// `unsupported_module`, etc.). This function allows to enable or disable
+    /// a specific type of warning identified by the given code.
+    ///
+    /// Returns an error if the given warning code doesn't exist.
+    pub fn switch_warning(
+        &mut self,
+        code: &str,
+        enabled: bool,
+    ) -> Result<&mut Self, InvalidWarningCode> {
+        self.warnings.switch_warning(code, enabled)?;
+        Ok(self)
+    }
+
+    /// Enables or disables all warnings.
+    pub fn switch_all_warnings(&mut self, enabled: bool) -> &mut Self {
+        self.warnings.switch_all_warnings(enabled);
         self
     }
 
@@ -590,7 +932,60 @@ impl<'a> Compiler<'a> {
         self
     }
 
+    /// When enabled, slow patterns produce an error instead of a warning.
+    ///
+    /// This is disabled by default.
+    pub fn error_on_slow_pattern(&mut self, yes: bool) -> &mut Self {
+        self.error_on_slow_pattern = yes;
+        self
+    }
+
+    /// When enabled, potentially slow loops produce an error instead of a
+    /// warning.
+    ///
+    /// This is disabled by default.
+    pub fn error_on_slow_loop(&mut self, yes: bool) -> &mut Self {
+        self.error_on_slow_loop = yes;
+        self
+    }
+
+    /// When enabled, the compiler tries to optimize rule conditions.
+    ///
+    /// The optimizations usually reduce condition evaluation times, specially
+    /// in complex rules that contain loops, but it can break short-circuit
+    /// evaluation rules because some subexpressions are not executed in the
+    /// order they appear in the source code.
+    ///
+    /// This is a very experimental feature.
+    #[doc(hidden)]
+    pub fn condition_optimization(&mut self, yes: bool) -> &mut Self {
+        // CSE is explicitly disabled for now.
+        self.cse(false).hoisting(yes)
+    }
+
+    pub(crate) fn cse(&mut self, yes: bool) -> &mut Self {
+        self.cse = yes;
+        self
+    }
+
+    pub(crate) fn hoisting(&mut self, yes: bool) -> &mut Self {
+        self.hoisting = yes;
+        self
+    }
+
+    /// Retrieves all errors generated by the compiler.
+    ///
+    /// This method returns every error encountered during the compilation,
+    /// across all invocations of [`Compiler::add_source`].
+    #[inline]
+    pub fn errors(&self) -> &[CompileError] {
+        self.errors.as_slice()
+    }
+
     /// Returns the warnings emitted by the compiler.
+    ///
+    /// This method returns every warning issued during the compilation,
+    /// across all invocations of [`Compiler::add_source`].
     #[inline]
     pub fn warnings(&self) -> &[Warning] {
         self.warnings.as_slice()
@@ -610,7 +1005,7 @@ impl<'a> Compiler<'a> {
     }
 }
 
-impl<'a> Compiler<'a> {
+impl Compiler<'_> {
     fn add_sub_pattern<I, F, A>(
         &mut self,
         sub_pattern: SubPattern,
@@ -637,28 +1032,51 @@ impl<'a> Compiler<'a> {
         sub_pattern_id
     }
 
-    /// Check if another rule, module or variable has the given identifier and
+    /// Checks if another rule, module or variable has the given identifier and
     /// return an error in that case.
     fn check_for_existing_identifier(
         &self,
         ident: &Ident,
-    ) -> Result<(), Box<CompileError>> {
+    ) -> Result<(), CompileError> {
         if let Some(symbol) = self.symbol_table.lookup(ident.name) {
-            return match symbol.kind() {
-                SymbolKind::Rule(rule_id) => {
-                    Err(Box::new(CompileError::duplicate_rule(
-                        &self.report_builder,
-                        ident.name.to_string(),
-                        ident.span,
-                        self.rules.get(rule_id.0 as usize).unwrap().ident_span,
-                    )))
-                }
-                _ => Err(Box::new(CompileError::conflicting_rule_identifier(
+            return match symbol {
+                // Found another rule with the same name.
+                Symbol::Rule(rule_id) => Err(DuplicateRule::build(
                     &self.report_builder,
                     ident.name.to_string(),
-                    ident.span,
-                ))),
+                    ident.span().into(),
+                    self.rules
+                        .get(rule_id.0 as usize)
+                        .unwrap()
+                        .ident_ref
+                        .clone(),
+                )),
+                // Found another symbol that is not a rule, but has the same
+                // name.
+                _ => Err(ConflictingRuleIdentifier::build(
+                    &self.report_builder,
+                    ident.name.to_string(),
+                    ident.span().into(),
+                )),
             };
+        }
+        Ok(())
+    }
+
+    /// Checks that tags are not duplicate.
+    fn check_for_duplicate_tags(
+        &self,
+        tags: &[Ident],
+    ) -> Result<(), CompileError> {
+        let mut s = HashSet::new();
+        for tag in tags {
+            if !s.insert(tag.name) {
+                return Err(DuplicateTag::build(
+                    &self.report_builder,
+                    tag.name.to_string(),
+                    tag.span().into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -710,13 +1128,81 @@ impl<'a> Compiler<'a> {
         self.atoms.truncate(snapshot.atoms_len);
         self.symbol_table.truncate(snapshot.symbol_table_len);
     }
+
+    /// Sets a writer where the compiler will write the Intermediate
+    /// Representation (IR) of compiled conditions.
+    ///
+    /// This is used for testing and debugging purposes.
+    #[doc(hidden)]
+    pub fn set_ir_writer<W: Write + 'static>(&mut self, w: W) -> &mut Self {
+        self.ir_writer = Some(Box::new(w));
+        self
+    }
+
+    /// Returns true if the bytes in the slice are all 0x00, 0x90, or 0xff.
+    fn common_byte_repetition(bytes: &[u8]) -> bool {
+        let mut all_x00 = true;
+        let mut all_x90 = true;
+        let mut all_xff = true;
+
+        for b in bytes {
+            match *b {
+                0x00 => {
+                    all_x90 = false;
+                    all_xff = false;
+                }
+                0x90 => {
+                    all_x00 = false;
+                    all_xff = false;
+                }
+                0xff => {
+                    all_x00 = false;
+                    all_x90 = false;
+                }
+                _ => return false,
+            }
+            if !all_x00 && !all_x90 && !all_xff {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
-impl<'a> Compiler<'a> {
-    fn c_rule(&mut self, rule: &ast::Rule) -> Result<(), Box<CompileError>> {
+impl Compiler<'_> {
+    fn c_rule(&mut self, rule: &ast::Rule) -> Result<(), CompileError> {
         // Check if another rule, module or variable has the same identifier
         // and return an error in that case.
         self.check_for_existing_identifier(&rule.identifier)?;
+
+        // Check that rule tags, if any, doesn't contain duplicates.
+        if let Some(tags) = &rule.tags {
+            self.check_for_duplicate_tags(tags.as_slice())?;
+        }
+
+        // Check the rule with all the linters.
+        for linter in self.linters.iter() {
+            match linter.check(&self.report_builder, rule) {
+                LinterResult::Ok => {}
+                LinterResult::Warn(warning) => {
+                    self.warnings.add(|| warning);
+                }
+                LinterResult::Warns(warnings) => {
+                    for warning in warnings {
+                        self.warnings.add(|| warning);
+                    }
+                }
+                LinterResult::Err(err) => return Err(err),
+            }
+        }
+
+        let tags: Vec<IdentId> = rule
+            .tags
+            .iter()
+            .flatten()
+            .map(|t| self.ident_pool.get_or_intern(t.name))
+            .collect();
 
         // Take snapshot of the current compiler state. In case of error
         // compiling the current rule this snapshot allows restoring the
@@ -729,7 +1215,21 @@ impl<'a> Compiler<'a> {
 
         // The RuleId for the new rule is current length of `self.rules`. The
         // first rule has RuleId = 0.
-        let rule_id = RuleId(self.rules.len() as i32);
+        let rule_id = RuleId::from(self.rules.len());
+
+        // Helper function that converts from `ast::MetaValue` to
+        // `compiler::rules::MetaValue`.
+        let mut convert_meta_value = |value: &ast::MetaValue| match value {
+            ast::MetaValue::Integer((i, _)) => MetaValue::Integer(*i),
+            ast::MetaValue::Float((f, _)) => MetaValue::Float(*f),
+            ast::MetaValue::Bool((b, _)) => MetaValue::Bool(*b),
+            ast::MetaValue::String((s, _)) => {
+                MetaValue::String(self.lit_pool.get_or_intern(s))
+            }
+            ast::MetaValue::Bytes((s, _)) => {
+                MetaValue::Bytes(self.lit_pool.get_or_intern(s))
+            }
+        };
 
         // Build a vector of pairs (IdentId, MetaValue) for every meta defined
         // in the rule.
@@ -740,17 +1240,7 @@ impl<'a> Compiler<'a> {
             .map(|m| {
                 (
                     self.ident_pool.get_or_intern(m.identifier.name),
-                    match &m.value {
-                        ast::MetaValue::Integer(i) => MetaValue::Integer(*i),
-                        ast::MetaValue::Float(f) => MetaValue::Float(*f),
-                        ast::MetaValue::Bool(b) => MetaValue::Bool(*b),
-                        ast::MetaValue::String(s) => {
-                            MetaValue::String(self.lit_pool.get_or_intern(s))
-                        }
-                        ast::MetaValue::Bytes(s) => {
-                            MetaValue::Bytes(self.lit_pool.get_or_intern(s))
-                        }
-                    },
+                    convert_meta_value(&m.value),
                 )
             })
             .collect();
@@ -767,95 +1257,162 @@ impl<'a> Compiler<'a> {
             namespace_id: self.current_namespace.id,
             namespace_ident_id: self.current_namespace.ident_id,
             ident_id: self.ident_pool.get_or_intern(rule.identifier.name),
-            ident_span: rule.identifier.span,
+            ident_ref: CodeLoc::new(
+                self.report_builder.current_source_id(),
+                rule.identifier.span(),
+            ),
+            tags,
             patterns: vec![],
-            is_global: rule.flags.contains(RuleFlag::Global),
-            is_private: rule.flags.contains(RuleFlag::Private),
+            is_global: rule.flags.contains(RuleFlags::Global),
+            is_private: rule.flags.contains(RuleFlags::Private),
             metadata: meta,
         });
 
         let mut rule_patterns = Vec::new();
 
         let mut ctx = CompileContext {
+            ir: &mut self.ir,
             relaxed_re_syntax: self.relaxed_re_syntax,
-            current_symbol_table: None,
+            error_on_slow_loop: self.error_on_slow_loop,
+            one_shot_symbol_table: None,
             symbol_table: &mut self.symbol_table,
-            ident_pool: &mut self.ident_pool,
             report_builder: &self.report_builder,
-            rules: &self.rules,
             current_rule_patterns: &mut rule_patterns,
             warnings: &mut self.warnings,
             vars: VarStack::new(),
+            for_of_depth: 0,
+            features: &self.features,
         };
 
-        // Convert the patterns from AST to IR. Populates `patterns_in_rule`
-        // vector.
-        if let Err(err) = patterns_from_ast(&mut ctx, rule.patterns.as_ref()) {
+        // Convert the patterns from AST to IR. This populates the
+        // `ctx.current_rule_patterns` vector.
+        if let Err(err) = patterns_from_ast(&mut ctx, rule) {
             drop(ctx);
             self.restore_snapshot(snapshot);
-            return Err(Box::new(*err));
+            return Err(err);
         };
 
         // Convert the rule condition's AST to the intermediate representation
         // (IR). Also updates the patterns with information about whether they
-        // are anchored or not.
-        let condition = bool_expr_from_ast(&mut ctx, &rule.condition);
+        // are used in the condition and if they are anchored or not.
+        let condition = rule_condition_from_ast(&mut ctx, rule);
 
         drop(ctx);
+
+        // Search for patterns that are very common byte repetitions like:
+        //
+        //   00 00 00 00 00 00 ....
+        //   90 90 09 90 90 90 ....
+        //   FF FF FF FF FF FF ....
+        //
+        // Raise a warning when such a pattern is found, except in the
+        // following cases:
+        //
+        // 1) When the pattern is anchored, because anchored pattern can appear
+        //    only at a fixed offset and are not searched by Aho-Corasick.
+        //
+        // 2) When the pattern has attributes: xor, fullword, base64 or
+        //    base64wide, because in those cases the real pattern is not that
+        //    common.
+        //
+        // Note: this can't be done before calling `rule_condition_from_ast`,
+        // because we don't know which patterns are anchored until the condition
+        // is processed.
+        for pat in rule_patterns.iter() {
+            if pat.anchored_at().is_none()
+                && !pat.pattern().flags().intersects(
+                    PatternFlags::Xor
+                        | PatternFlags::Fullword
+                        | PatternFlags::Base64
+                        | PatternFlags::Base64Wide,
+                )
+            {
+                let literal_bytes = match pat.pattern() {
+                    Pattern::Text(lit) => Some(lit.text.as_bytes()),
+                    Pattern::Regexp(re) => re.hir.as_literal_bytes(),
+                    Pattern::Hex(re) => re.hir.as_literal_bytes(),
+                };
+                if let Some(literal_bytes) = literal_bytes {
+                    if Self::common_byte_repetition(literal_bytes) {
+                        self.warnings.add(|| {
+                            warnings::SlowPattern::build(
+                                &self.report_builder,
+                                pat.span().into(),
+                            )
+                        });
+                    }
+                }
+            }
+        }
 
         // In case of error, restore the compiler to the state it was before
         // entering this function. Also, if the error is due to an unknown
         // identifier, but the identifier is one of the unsupported modules,
         // the error is tolerated and a warning is issued instead.
-        let mut condition = match condition.map_err(|err| *err) {
+        let mut condition = match condition {
             Ok(condition) => condition,
-            Err(CompileError::UnknownIdentifier {
-                identifier, span, ..
-            }) if self.ignored_modules.contains(&identifier)
-                || self.ignored_rules.contains_key(&identifier) =>
+            Err(CompileError::UnknownIdentifier(unknown))
+                if self.ignored_rules.contains_key(unknown.identifier())
+                    || self.ignored_modules.contains(unknown.identifier()) =>
             {
                 self.restore_snapshot(snapshot);
 
-                if let Some(module_name) = self.ignored_rules.get(&identifier)
+                if let Some(module_name) =
+                    self.ignored_rules.get(unknown.identifier())
                 {
                     self.warnings.add(|| {
-                        Warning::ignored_rule(
+                        warnings::IgnoredRule::build(
                             &self.report_builder,
-                            rule.identifier.name.to_string(),
-                            identifier.clone(),
                             module_name.clone(),
-                            span,
+                            rule.identifier.name.to_string(),
+                            unknown.identifier_location().clone(),
                         )
                     });
+                    self.ignored_rules.insert(
+                        rule.identifier.name.to_string(),
+                        module_name.clone(),
+                    );
                 } else {
                     self.warnings.add(|| {
-                        Warning::ignored_module(
+                        warnings::IgnoredModule::build(
                             &self.report_builder,
-                            identifier.clone(),
-                            span,
+                            unknown.identifier().to_string(),
+                            unknown.identifier_location().clone(),
                             Some(format!(
                                 "the whole rule `{}` will be ignored",
                                 rule.identifier.name
                             )),
                         )
                     });
-                    self.ignored_rules
-                        .insert(rule.identifier.name.to_string(), identifier);
+                    self.ignored_rules.insert(
+                        rule.identifier.name.to_string(),
+                        unknown.identifier().to_string(),
+                    );
                 }
 
                 return Ok(());
             }
             Err(err) => {
                 self.restore_snapshot(snapshot);
-                return Err(Box::new(err));
+                return Err(err);
             }
         };
 
+        if self.cse {
+            condition = self.ir.cse();
+        }
+
+        if self.hoisting {
+            condition = self.ir.hoisting();
+        }
+
+        if let Some(w) = &mut self.ir_writer {
+            writeln!(w, "RULE {}", rule.identifier.name).unwrap();
+            writeln!(w, "{:?}", self.ir).unwrap();
+        }
+
         // Create a new symbol of bool type for the rule.
-        let new_symbol = Symbol::new(
-            TypeValue::Bool(Value::Unknown),
-            SymbolKind::Rule(rule_id),
-        );
+        let new_symbol = Symbol::Rule(rule_id);
 
         // Insert the symbol in the symbol table corresponding to the
         // current namespace.
@@ -875,6 +1432,16 @@ impl<'a> Compiler<'a> {
         let current_rule = self.rules.last_mut().unwrap();
 
         for pattern in &rule_patterns {
+            // Raise error is some pattern was not used, except if the pattern
+            // identifier starts with underscore.
+            if !pattern.in_use() && !pattern.identifier().starts_with("$_") {
+                return Err(UnusedPattern::build(
+                    &self.report_builder,
+                    pattern.identifier().name.to_string(),
+                    pattern.identifier().span().into(),
+                ));
+            }
+
             // Check if this pattern has been declared before, in this rule or
             // in some other rule. In such cases the pattern ID is re-used, and
             // we don't need to process (i.e: extract atoms and add them to
@@ -896,8 +1463,15 @@ impl<'a> Compiler<'a> {
                     }
                 };
 
+            let pattern_kind = match pattern.pattern() {
+                Pattern::Text(_) => PatternKind::Text,
+                Pattern::Regexp(_) => PatternKind::Regexp,
+                Pattern::Hex(_) => PatternKind::Hex,
+            };
+
             current_rule.patterns.push((
-                self.ident_pool.get_or_intern(pattern.identifier()),
+                self.ident_pool.get_or_intern(pattern.identifier().name),
+                pattern_kind,
                 pattern_id,
             ));
 
@@ -917,10 +1491,10 @@ impl<'a> Compiler<'a> {
                 self.current_pattern_id = *pattern_id;
                 let anchored_at = pattern.anchored_at();
                 match pattern.into_pattern() {
-                    Pattern::Literal(pattern) => {
+                    Pattern::Text(pattern) => {
                         self.c_literal_pattern(pattern, anchored_at);
                     }
-                    Pattern::Regexp(pattern) => {
+                    Pattern::Regexp(pattern) | Pattern::Hex(pattern) => {
                         if let Err(err) =
                             self.c_regexp_pattern(pattern, anchored_at, span)
                         {
@@ -940,32 +1514,27 @@ impl<'a> Compiler<'a> {
         // will remain in the WASM module.
         let mut ctx = EmitContext {
             current_rule: self.rules.last_mut().unwrap(),
-            current_signature: None,
             lit_pool: &mut self.lit_pool,
             regexp_pool: &mut self.regexp_pool,
             wasm_symbols: &self.wasm_symbols,
             wasm_exports: &self.wasm_exports,
             exception_handler_stack: Vec::new(),
             lookup_list: Vec::new(),
-            vars: VarStack::new(),
         };
 
         emit_rule_condition(
             &mut ctx,
-            &mut self.wasm_mod,
+            &self.ir,
             rule_id,
-            &mut condition,
+            condition,
+            &mut self.wasm_mod,
         );
-
-        // After emitting the whole condition, the stack of variables should
-        // be empty.
-        assert_eq!(ctx.vars.used, 0);
 
         Ok(())
     }
 
-    fn c_import(&mut self, import: &Import) -> Result<(), Box<CompileError>> {
-        let module_name = import.module_name.as_str();
+    fn c_import(&mut self, import: &Import) -> Result<(), CompileError> {
+        let module_name = import.module_name;
         let module = BUILTIN_MODULES.get(module_name);
 
         // Does a module with the given name actually exist? ...
@@ -975,10 +1544,10 @@ impl<'a> Compiler<'a> {
             // only a warning.
             return if self.ignored_modules.iter().any(|m| m == module_name) {
                 self.warnings.add(|| {
-                    Warning::ignored_module(
+                    warnings::IgnoredModule::build(
                         &self.report_builder,
                         module_name.to_string(),
-                        import.span(),
+                        import.span().into(),
                         None,
                     )
                 });
@@ -986,11 +1555,11 @@ impl<'a> Compiler<'a> {
             } else {
                 // The module does not exist, and is not explicitly added to
                 // the list of unsupported modules, that's an error.
-                Err(Box::new(CompileError::unknown_module(
+                Err(UnknownModule::build(
                     &self.report_builder,
                     module_name.to_string(),
-                    import.span(),
-                )))
+                    import.span().into(),
+                ))
             };
         }
 
@@ -1057,6 +1626,21 @@ impl<'a> Compiler<'a> {
             );
         }
 
+        // Is the module banned? If yes, produce an error. Notice however that
+        // this check is done after the module has been added to the symbol
+        // table because we don't want additional errors due to undefined
+        // identifiers when the banned module is used in some rule condition.
+        if let Some((error_title, error_msg)) =
+            self.banned_modules.get(module_name)
+        {
+            return Err(CustomError::build(
+                &self.report_builder,
+                error_title.clone(),
+                error_msg.clone(),
+                import.span().into(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -1066,11 +1650,11 @@ impl<'a> Compiler<'a> {
         anchored_at: Option<usize>,
     ) {
         let full_word = pattern.flags.contains(PatternFlags::Fullword);
-        let mut flags = SubPatternFlagSet::none();
+        let mut flags = SubPatternFlags::empty();
 
         if full_word {
-            flags.set(SubPatternFlags::FullwordLeft);
-            flags.set(SubPatternFlags::FullwordRight);
+            flags.insert(SubPatternFlags::FullwordLeft);
+            flags.insert(SubPatternFlags::FullwordRight);
         }
 
         // Depending on the combination of `ascii` and `wide` modifiers, the
@@ -1242,7 +1826,7 @@ impl<'a> Compiler<'a> {
         pattern: RegexpPattern,
         anchored_at: Option<usize>,
         span: Span,
-    ) -> Result<(), Box<CompileError>> {
+    ) -> Result<(), CompileError> {
         // Try splitting the regexp into multiple chained sub-patterns if it
         // contains large gaps. For example, `{ 01 02 03 [-] 04 05 06 }` is
         // split into `{ 01 02 03 }` and `{ 04 05 06 }`, where `{ 04 05 06 }`
@@ -1263,32 +1847,35 @@ impl<'a> Compiler<'a> {
             //   /foo|bar|baz/
             //   { 01 02 03 }
             //   { (01 02 03 | 04 05 06 ) }
-            self.c_alternation_literal(head, anchored_at, pattern.flags);
-            return Ok(());
+            return self.c_alternation_literal(
+                head,
+                anchored_at,
+                pattern.flags,
+            );
         }
 
         // If this point is reached, this is a pattern that can't be split into
         // multiple chained patterns, and is neither a literal or alternation
         // of literals. Most patterns fall in this category.
-        let mut flags = SubPatternFlagSet::none();
+        let mut flags = SubPatternFlags::empty();
 
         if pattern.flags.contains(PatternFlags::Nocase) {
-            flags.set(SubPatternFlags::Nocase);
+            flags.insert(SubPatternFlags::Nocase);
         }
 
         if pattern.flags.contains(PatternFlags::Fullword) {
-            flags.set(SubPatternFlags::FullwordLeft);
-            flags.set(SubPatternFlags::FullwordRight);
+            flags.insert(SubPatternFlags::FullwordLeft);
+            flags.insert(SubPatternFlags::FullwordRight);
         }
 
         if matches!(head.is_greedy(), Some(true)) {
-            flags.set(SubPatternFlags::GreedyRegexp);
+            flags.insert(SubPatternFlags::GreedyRegexp);
         }
 
         let (atoms, is_fast_regexp) = self.c_regexp(&head, span)?;
 
         if is_fast_regexp {
-            flags.set(SubPatternFlags::FastRegexp);
+            flags.insert(SubPatternFlags::FastRegexp);
         }
 
         if pattern.flags.contains(PatternFlags::Wide) {
@@ -1314,22 +1901,22 @@ impl<'a> Compiler<'a> {
         &mut self,
         hir: re::hir::Hir,
         anchored_at: Option<usize>,
-        flags: PatternFlagSet,
-    ) {
+        flags: PatternFlags,
+    ) -> Result<(), CompileError> {
         let ascii = flags.contains(PatternFlags::Ascii);
         let wide = flags.contains(PatternFlags::Wide);
         let case_insensitive = flags.contains(PatternFlags::Nocase);
         let full_word = flags.contains(PatternFlags::Fullword);
 
-        let mut flags = SubPatternFlagSet::none();
+        let mut flags = SubPatternFlags::empty();
 
         if case_insensitive {
-            flags.set(SubPatternFlags::Nocase);
+            flags.insert(SubPatternFlags::Nocase);
         }
 
         if full_word {
-            flags.set(SubPatternFlags::FullwordLeft);
-            flags.set(SubPatternFlags::FullwordRight);
+            flags.insert(SubPatternFlags::FullwordLeft);
+            flags.insert(SubPatternFlags::FullwordRight);
         }
 
         let mut process_literal = |literal: &hir::Literal, wide: bool| {
@@ -1397,28 +1984,30 @@ impl<'a> Compiler<'a> {
             }
             _ => unreachable!(),
         }
+
+        Ok(())
     }
 
     fn c_chain(
         &mut self,
         leading: &re::hir::Hir,
         trailing: &[ChainedPattern],
-        flags: PatternFlagSet,
+        flags: PatternFlags,
         span: Span,
-    ) -> Result<(), Box<CompileError>> {
+    ) -> Result<(), CompileError> {
         let ascii = flags.contains(PatternFlags::Ascii);
         let wide = flags.contains(PatternFlags::Wide);
         let case_insensitive = flags.contains(PatternFlags::Nocase);
         let full_word = flags.contains(PatternFlags::Fullword);
 
-        let mut common_flags = SubPatternFlagSet::none();
+        let mut common_flags = SubPatternFlags::empty();
 
         if case_insensitive {
-            common_flags.set(SubPatternFlags::Nocase);
+            common_flags.insert(SubPatternFlags::Nocase);
         }
 
         if matches!(leading.is_greedy(), Some(true)) {
-            common_flags.set(SubPatternFlags::GreedyRegexp);
+            common_flags.insert(SubPatternFlags::GreedyRegexp);
         }
 
         let mut prev_sub_pattern_ascii = SubPatternId(0);
@@ -1428,7 +2017,7 @@ impl<'a> Compiler<'a> {
             let mut flags = common_flags;
 
             if full_word {
-                flags.set(SubPatternFlags::FullwordLeft);
+                flags.insert(SubPatternFlags::FullwordLeft);
             }
 
             if ascii {
@@ -1445,14 +2034,15 @@ impl<'a> Compiler<'a> {
         } else {
             let mut flags = common_flags;
 
-            let (atoms, is_fast_regexp) = self.c_regexp(leading, span)?;
+            let (atoms, is_fast_regexp) =
+                self.c_regexp(leading, span.clone())?;
 
             if is_fast_regexp {
-                flags.set(SubPatternFlags::FastRegexp);
+                flags.insert(SubPatternFlags::FastRegexp);
             }
 
             if full_word {
-                flags.set(SubPatternFlags::FullwordLeft);
+                flags.insert(SubPatternFlags::FullwordLeft);
             }
 
             if wide {
@@ -1479,12 +2069,12 @@ impl<'a> Compiler<'a> {
 
             // The last pattern in the chain has the `LastInChain` flag and
             // the `FullwordRight` if the original pattern was `Fullword`.
-            // Patterns in the middle of the chain won't have neither of these
+            // Patterns in the middle of the chain won't have either of these
             // flags.
             if i == trailing.len() - 1 {
-                flags.set(SubPatternFlags::LastInChain);
+                flags.insert(SubPatternFlags::LastInChain);
                 if full_word {
-                    flags.set(SubPatternFlags::FullwordRight);
+                    flags.insert(SubPatternFlags::FullwordRight);
                 }
             }
 
@@ -1507,13 +2097,14 @@ impl<'a> Compiler<'a> {
                 }
             } else {
                 if matches!(p.hir.is_greedy(), Some(true)) {
-                    flags.set(SubPatternFlags::GreedyRegexp);
+                    flags.insert(SubPatternFlags::GreedyRegexp);
                 }
 
-                let (atoms, is_fast_regexp) = self.c_regexp(&p.hir, span)?;
+                let (atoms, is_fast_regexp) =
+                    self.c_regexp(&p.hir, span.clone())?;
 
                 if is_fast_regexp {
-                    flags.set(SubPatternFlags::FastRegexp);
+                    flags.insert(SubPatternFlags::FastRegexp);
                 }
 
                 if wide {
@@ -1549,7 +2140,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         hir: &re::hir::Hir,
         span: Span,
-    ) -> Result<(Vec<re::RegexpAtom>, bool), Box<CompileError>> {
+    ) -> Result<(Vec<re::RegexpAtom>, bool), CompileError> {
         // When the `fast-regexp` feature is enabled, try to compile the regexp
         // for `FastVM` first, if it fails with `Error::FastIncompatible`, the
         // regexp is not compatible for `FastVM` and `PikeVM` must be used
@@ -1571,45 +2162,67 @@ impl<'a> Compiler<'a> {
             false,
         );
 
-        let mut atoms = result.map_err(|err| match err {
-            re::Error::TooLarge => Box::new(CompileError::invalid_regexp(
+        let re_atoms = result.map_err(|err| match err {
+            re::Error::TooLarge => InvalidRegexp::build(
                 &self.report_builder,
                 "regexp is too large".to_string(),
-                span,
+                (&span).into(),
                 None,
-            )),
+            ),
             _ => unreachable!(),
         })?;
 
         if matches!(hir.minimum_len(), Some(0)) {
-            return Err(Box::new(CompileError::invalid_regexp(
+            return Err(InvalidRegexp::build(
                 &self.report_builder,
                 "this regexp can match empty strings".to_string(),
-                span,
+                (&span).into(),
                 None,
-            )));
+            ));
         }
 
-        let mut slow_pattern = false;
+        let slow_pattern =
+            match re_atoms.iter().map(|re_atom| re_atom.atom.len()).minmax() {
+                // No atoms, slow pattern.
+                MinMaxResult::NoElements => true,
+                // Only one atom shorter than 2 bytes, slow pattern.
+                MinMaxResult::OneElement(len) if len < 2 => true,
+                // More than one atom, at least one is shorter than 2 bytes.
+                MinMaxResult::MinMax(min, _) if min < 2 => true,
+                // More than 2700 atoms, all with exactly 2 bytes.
+                // Why 2700?. The larger the number of atoms the higher the
+                // odds of finding one of them in the data, which slows down
+                // the scan. The regex [A-Za-z]{N,} (with N>=2) produces
+                // (26+26)^2 = 2704 atoms. So, 2700 is large enough, but
+                // produces a warning with the aforementioned regex.
+                MinMaxResult::MinMax(2, 2) if re_atoms.len() > 2700 => true,
+                // In all other cases the pattern is not slow.
+                _ => false,
+            };
 
-        for atom in atoms.iter_mut() {
-            if atom.atom.len() < 2 {
-                slow_pattern = true;
+        if slow_pattern {
+            if self.error_on_slow_pattern {
+                return Err(errors::SlowPattern::build(
+                    &self.report_builder,
+                    span.into(),
+                ));
+            } else {
+                self.warnings.add(|| {
+                    warnings::SlowPattern::build(
+                        &self.report_builder,
+                        span.into(),
+                    )
+                });
             }
         }
 
-        if slow_pattern {
-            self.warnings
-                .add(|| Warning::slow_pattern(&self.report_builder, span));
-        }
-
-        Ok((atoms, is_fast_regexp))
+        Ok((re_atoms, is_fast_regexp))
     }
 
     fn c_literal_chain_head(
         &mut self,
         literal: &hir::Literal,
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     ) -> SubPatternId {
         let pattern_lit_id = self.intern_literal(
             literal.0.as_bytes(),
@@ -1629,8 +2242,8 @@ impl<'a> Compiler<'a> {
         &mut self,
         literal: &hir::Literal,
         chained_to: SubPatternId,
-        gap: RangeInclusive<u32>,
-        flags: SubPatternFlagSet,
+        gap: ChainedPatternGap,
+        flags: SubPatternFlags,
     ) -> SubPatternId {
         let pattern_lit_id = self.intern_literal(
             literal.0.as_bytes(),
@@ -1722,8 +2335,18 @@ impl From<LiteralId> for u64 {
 pub(crate) struct NamespaceId(i32);
 
 /// ID associated to each rule.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct RuleId(i32);
+
+impl RuleId {
+    /// Returns the [`RuleId`] that comes after this one.
+    ///
+    /// This simply adds 1 to the ID.
+    #[allow(dead_code)]
+    pub(crate) fn next(&self) -> Self {
+        RuleId(self.0 + 1)
+    }
+}
 
 impl From<i32> for RuleId {
     #[inline]
@@ -1743,6 +2366,13 @@ impl From<RuleId> for usize {
     #[inline]
     fn from(value: RuleId) -> Self {
         value.0 as usize
+    }
+}
+
+impl From<RuleId> for i32 {
+    #[inline]
+    fn from(value: RuleId) -> Self {
+        value.0
     }
 }
 
@@ -1871,30 +2501,30 @@ impl<'a> Iterator for Imports<'a> {
     }
 }
 
-bitmask! {
+bitflags! {
     /// Flags associated to some kinds of [`SubPattern`].
-    #[derive(Debug, Serialize, Deserialize)]
-    pub mask SubPatternFlagSet: u8 where flags SubPatternFlags  {
-        Wide                 = 0x01,
-        Nocase               = 0x02,
+    #[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SubPatternFlags: u16  {
+        const Wide                 = 0x01;
+        const Nocase               = 0x02;
         // Indicates that the pattern is the last one in chain. Applies only
         // to chained sub-patterns.
-        LastInChain          = 0x04,
-        FullwordLeft         = 0x08,
-        FullwordRight        = 0x10,
+        const LastInChain          = 0x04;
+        const FullwordLeft         = 0x08;
+        const FullwordRight        = 0x10;
         // Indicates that the pattern is a greedy regexp. Apply only to regexp
         // sub-patterns, or to any sub-pattern is part of chain that corresponds
         // to a greedy regexp.
-        GreedyRegexp         = 0x20,
+        const GreedyRegexp         = 0x20;
         // Indicates that the pattern is a fast regexp. A fast regexp is one
         // that can be matched by the FastVM.
-        FastRegexp           = 0x40,
+        const FastRegexp           = 0x40;
     }
 }
 
 /// A sub-pattern in the compiled rules.
 ///
-/// Each pattern in a rule has one ore more associated sub-patterns. For
+/// Each pattern in a rule has one or more associated sub-patterns. For
 /// example, the pattern `$a = "foo" ascii wide` has a sub-pattern for the
 /// ASCII variant of "foo", and another one for the wide variant.
 ///
@@ -1906,38 +2536,38 @@ pub(crate) enum SubPattern {
     Literal {
         pattern: LiteralId,
         anchored_at: Option<usize>,
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     },
 
     LiteralChainHead {
         pattern: LiteralId,
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     },
 
     LiteralChainTail {
         pattern: LiteralId,
         chained_to: SubPatternId,
-        gap: RangeInclusive<u32>,
-        flags: SubPatternFlagSet,
+        gap: ChainedPatternGap,
+        flags: SubPatternFlags,
     },
 
     Regexp {
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     },
 
     RegexpChainHead {
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     },
 
     RegexpChainTail {
         chained_to: SubPatternId,
-        gap: RangeInclusive<u32>,
-        flags: SubPatternFlagSet,
+        gap: ChainedPatternGap,
+        flags: SubPatternFlags,
     },
 
     Xor {
         pattern: LiteralId,
-        flags: SubPatternFlagSet,
+        flags: SubPatternFlags,
     },
 
     Base64 {
@@ -1986,4 +2616,95 @@ struct Snapshot {
     re_code_len: usize,
     sub_patterns_len: usize,
     symbol_table_len: usize,
+}
+
+/// Error returned by [`Compiler::switch_warning`] when the warning
+/// code is not valid.
+#[derive(Error, Debug, Eq, PartialEq)]
+#[error("`{0}` is not a valid warning code")]
+pub struct InvalidWarningCode(String);
+
+/// Represents a list of warnings.
+///
+/// This is a wrapper around a `Vec<Warning>` that contains additional logic
+/// for limiting the number of warnings stored in the vector and silencing some
+/// warnings types.
+pub(crate) struct Warnings {
+    warnings: Vec<Warning>,
+    max_warnings: usize,
+    disabled_warnings: HashSet<String>,
+}
+
+impl Default for Warnings {
+    fn default() -> Self {
+        Self {
+            warnings: Vec::new(),
+            max_warnings: 100,
+            disabled_warnings: HashSet::default(),
+        }
+    }
+}
+
+impl Warnings {
+    /// Adds the warning returned by `f` to the list.
+    ///
+    /// If the maximum number of warnings has been reached the warning is not
+    /// added.
+    #[inline]
+    pub fn add(&mut self, f: impl FnOnce() -> Warning) {
+        if self.warnings.len() < self.max_warnings {
+            let warning = f();
+            if !self.disabled_warnings.contains(warning.code()) {
+                self.warnings.push(warning);
+            }
+        }
+    }
+
+    /// Returns true if the given code is a valid warning code.
+    pub fn is_valid_code(code: &str) -> bool {
+        Warning::all_codes().iter().any(|c| *c == code)
+    }
+
+    /// Enables or disables a specific warning identified by `code`.
+    ///
+    /// Returns `true` if the warning was previously enabled, or `false` if
+    /// otherwise. Returns an error if the code doesn't correspond to any
+    /// of the existing warnings.
+    #[inline]
+    pub fn switch_warning(
+        &mut self,
+        code: &str,
+        enabled: bool,
+    ) -> Result<bool, InvalidWarningCode> {
+        if !Self::is_valid_code(code) {
+            return Err(InvalidWarningCode(code.to_string()));
+        }
+        if enabled {
+            Ok(!self.disabled_warnings.remove(code))
+        } else {
+            Ok(self.disabled_warnings.insert(code.to_string()))
+        }
+    }
+
+    /// Enable or disables all warnings.
+    pub fn switch_all_warnings(&mut self, enabled: bool) {
+        if enabled {
+            self.disabled_warnings.clear();
+        } else {
+            for c in Warning::all_codes() {
+                self.disabled_warnings.insert(c.to_string());
+            }
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Warning] {
+        self.warnings.as_slice()
+    }
+}
+
+impl From<Warnings> for Vec<Warning> {
+    fn from(value: Warnings) -> Self {
+        value.warnings
+    }
 }

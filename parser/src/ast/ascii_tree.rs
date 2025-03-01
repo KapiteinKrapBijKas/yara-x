@@ -35,11 +35,11 @@ pub(crate) fn rule_ascii_tree(rule: &Rule) -> Tree {
 
     let mut modifiers = Vec::new();
 
-    if rule.flags.contains(RuleFlag::Private) {
+    if rule.flags.contains(RuleFlags::Private) {
         modifiers.push("private");
     }
 
-    if rule.flags.contains(RuleFlag::Global) {
+    if rule.flags.contains(RuleFlags::Global) {
         modifiers.push("global");
     }
 
@@ -225,7 +225,7 @@ pub(crate) fn expr_ascii_tree(expr: &Expr) -> Tree {
         Expr::PatternCount(s) => {
             if let Some(range) = &s.range {
                 Node(
-                    format!("{} in <range>", s.name),
+                    format!("{} in <range>", s.identifier.name),
                     vec![Node(
                         "<range>".to_string(),
                         vec![
@@ -235,20 +235,20 @@ pub(crate) fn expr_ascii_tree(expr: &Expr) -> Tree {
                     )],
                 )
             } else {
-                Leaf(vec![s.name.to_string()])
+                Leaf(vec![s.identifier.name.to_string()])
             }
         }
         Expr::PatternOffset(s) | Expr::PatternLength(s) => {
             if let Some(index) = &s.index {
                 Node(
-                    format!("{}[<index>]", s.name),
+                    format!("{}[<index>]", s.identifier.name),
                     vec![Node(
                         "<index>".to_string(),
                         vec![expr_ascii_tree(index)],
                     )],
                 )
             } else {
-                Leaf(vec![s.name.to_string()])
+                Leaf(vec![s.identifier.name.to_string()])
             }
         }
         Expr::Lookup(l) => Node(
@@ -279,16 +279,20 @@ pub(crate) fn expr_ascii_tree(expr: &Expr) -> Tree {
                 .collect::<Vec<&str>>()
                 .join(", ");
 
-            let mut children = vec![Node(
-                "<callable>".to_string(),
-                vec![expr_ascii_tree(&expr.callable)],
-            )];
+            let mut children = if let Some(o) = &expr.object {
+                vec![Node("<object>".to_string(), vec![expr_ascii_tree(o)])]
+            } else {
+                Vec::new()
+            };
 
             for (label, arg) in labelled_args.into_iter() {
                 children.push(Node(label, vec![expr_ascii_tree(arg)]))
             }
 
-            Node(format!("<callable>({})", comma_sep_labels), children)
+            Node(
+                format!("{}({})", expr.identifier.name, comma_sep_labels),
+                children,
+            )
         }
         Expr::Of(of) => {
             let set_ascii_tree = match &of.items {
@@ -355,7 +359,7 @@ pub(crate) fn expr_ascii_tree(expr: &Expr) -> Tree {
                 ),
                 Node(
                     "<condition>".to_string(),
-                    vec![expr_ascii_tree(&for_of.condition)],
+                    vec![expr_ascii_tree(&for_of.body)],
                 ),
             ],
         ),
@@ -419,12 +423,35 @@ pub(crate) fn expr_ascii_tree(expr: &Expr) -> Tree {
 
             children.push(Node(
                 "<condition>".to_string(),
-                vec![expr_ascii_tree(&f.condition)],
+                vec![expr_ascii_tree(&f.body)],
             ));
 
             Node(node_title, children)
         }
+        Expr::With(w) => Node(
+            "with <identifiers> : ( <boolean expression> )".to_string(),
+            vec![
+                Node(
+                    "<identifiers>".to_string(),
+                    w.declarations
+                        .iter()
+                        .flat_map(with_items_ascii_tree)
+                        .collect(),
+                ),
+                Node(
+                    "<boolean expression>".to_string(),
+                    vec![expr_ascii_tree(&w.body)],
+                ),
+            ],
+        ),
     }
+}
+
+fn with_items_ascii_tree(declaration: &WithDeclaration) -> Vec<Tree> {
+    vec![
+        Leaf(vec![format!("{}", declaration.identifier.name)]),
+        expr_ascii_tree(&declaration.expression),
+    ]
 }
 
 pub(crate) fn quantifier_ascii_tree(quantifier: &Quantifier) -> Tree {
@@ -451,14 +478,14 @@ pub(crate) fn pattern_set_ascii_tree(pattern_set: &PatternSet) -> Tree {
 pub(crate) fn pattern_ascii_tree(pattern: &Pattern) -> Tree {
     match pattern {
         Pattern::Text(s) => Leaf(vec![format!(
-            "{} = \"{}\" {}",
+            "{} = {} {}",
             s.identifier.name,
-            s.text,
+            s.text.literal,
             s.modifiers.iter().map(|m| m.to_string()).join(" ")
         )]),
         Pattern::Hex(h) => Node(
             h.identifier.name.to_string(),
-            vec![hex_tokens_ascii_tree(&h.tokens)],
+            vec![hex_tokens_ascii_tree(&h.sub_patterns)],
         ),
         Pattern::Regexp(r) => Leaf(vec![format!(
             "{} = /{}/{}{} {}",
@@ -471,9 +498,8 @@ pub(crate) fn pattern_ascii_tree(pattern: &Pattern) -> Tree {
     }
 }
 
-pub(crate) fn hex_tokens_ascii_tree(tokens: &HexTokens) -> Tree {
+pub(crate) fn hex_tokens_ascii_tree(tokens: &HexSubPattern) -> Tree {
     let nodes = tokens
-        .tokens
         .iter()
         .map(|t| match t {
             HexToken::Byte(b) => {

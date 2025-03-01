@@ -7,7 +7,7 @@ use crate::re::fast::instr::Instr::{
 };
 
 /// Instructions supported by the Fast VM.
-pub enum Instr<'a> {
+pub(crate) enum Instr<'a> {
     /// Match for the regexp has been found.
     Match,
 
@@ -46,7 +46,7 @@ pub enum Instr<'a> {
     JumpNoNewlineUnbounded(RangeFrom<u16>),
 }
 
-impl<'a> Instr<'a> {
+impl Instr<'_> {
     pub const MATCH: u8 = 0x00;
     pub const LITERAL: u8 = 0x01;
     pub const MASKED_LITERAL: u8 = 0x02;
@@ -59,7 +59,7 @@ impl<'a> Instr<'a> {
 
 /// Parses a slice of bytes that contains Fast VM instructions, returning
 /// individual instructions and their arguments.
-pub struct InstrParser<'a> {
+pub(crate) struct InstrParser<'a> {
     code: &'a [u8],
 }
 

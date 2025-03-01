@@ -1,4 +1,4 @@
-/*! This modules contains the logic for extracting atoms from patterns,
+/*! This module contains the logic for extracting atoms from patterns,
 computing atom quality, choosing the best atoms from a pattern, etc.
 
 Atoms are undivided substrings found in patterns, for example, let's consider
@@ -72,20 +72,22 @@ pub(crate) use crate::compiler::atoms::quality::best_range_in_bytes;
 pub(crate) use crate::compiler::atoms::quality::best_range_in_masked_bytes;
 pub(crate) use crate::compiler::atoms::quality::AtomsQuality;
 
-use crate::compiler::{SubPatternFlagSet, SubPatternFlags};
+use crate::compiler::SubPatternFlags;
 
 /// The number of bytes that every atom *should* have. Some atoms may be
 /// shorter than DESIRED_ATOM_SIZE when it's impossible to extract a longer,
 /// good-quality atom from a string.
 pub(crate) const DESIRED_ATOM_SIZE: usize = 4;
 
-/// Maximum number of atoms that will be extracted from a regexp. 4096 is the
-/// number of different combinations of a pattern like { 11 ?? 1? 11 }. By
-/// increasing this number a higher number of longer atoms can be extracted
+/// Maximum number of atoms that will be extracted from a regexp. This number
+/// must be at least 4096, which is the number of different combinations of a
+/// pattern like { 11 ?? 1? 11 }.
+///
+/// By increasing this number a higher number of longer atoms can be extracted
 /// from a regexp, instead of lower number of shorter atoms. Longer atoms are
 /// preferred, but too many of them increase the size of the Aho-Corasick
 /// automaton and its build time.
-pub(crate) const MAX_ATOMS_PER_REGEXP: usize = 4096;
+pub(crate) const MAX_ATOMS_PER_REGEXP: usize = 8192;
 
 /// A substring extracted from a rule pattern. See the module documentation for
 /// a general explanation of what is an atom.
@@ -286,7 +288,7 @@ impl Atom {
 /// case combinations for that atom if the `Nocase` flag is set.
 pub(crate) fn extract_atoms(
     literal_bytes: &[u8],
-    flags: SubPatternFlagSet,
+    flags: SubPatternFlags,
 ) -> Box<dyn Iterator<Item = Atom>> {
     let mut best_atom = best_atom_in_bytes(literal_bytes);
 
@@ -327,7 +329,7 @@ pub(super) fn make_wide(s: &[u8]) -> Vec<u8> {
 }
 
 /// Iterator that returns all the atoms resulting from masking an atom with
-/// with a mask.
+/// a mask.
 pub(crate) struct MaskCombinations {
     cartesian_product: MultiProduct<ByteMaskCombinator>,
     backtrack: u16,

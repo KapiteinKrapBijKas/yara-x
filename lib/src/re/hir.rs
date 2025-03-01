@@ -1,25 +1,47 @@
+use bstr::ByteSlice;
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::ops::RangeInclusive;
+use std::ops::{RangeFrom, RangeInclusive};
 
-use regex_syntax;
-
-use yara_x_parser::ast::HexByte;
+use regex_syntax::hir::Class;
+use regex_syntax::hir::ClassBytes;
+use regex_syntax::hir::ClassBytesRange;
+use regex_syntax::hir::ClassUnicode;
+use regex_syntax::hir::ClassUnicodeRange;
+use regex_syntax::hir::Dot;
+use regex_syntax::hir::HirKind;
+use regex_syntax::hir::Repetition;
+use serde::{Deserialize, Serialize};
+use yara_x_parser::ast;
 
 use crate::utils::cast;
 
-pub use regex_syntax::hir::Class;
-pub use regex_syntax::hir::ClassBytes;
-pub use regex_syntax::hir::ClassBytesRange;
-pub use regex_syntax::hir::ClassUnicode;
-pub use regex_syntax::hir::ClassUnicodeRange;
-pub use regex_syntax::hir::Dot;
-pub use regex_syntax::hir::HirKind;
-pub use regex_syntax::hir::Repetition;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HexByte {
+    pub value: u8,
+    pub mask: u8,
+}
 
+impl From<ast::HexByte> for HexByte {
+    fn from(hex_byte: ast::HexByte) -> Self {
+        Self { value: hex_byte.value, mask: hex_byte.mask }
+    }
+}
+
+/// Represents the gap between two chained patterns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum ChainedPatternGap {
+    Bounded(RangeInclusive<u32>),
+    Unbounded(RangeFrom<u32>),
+}
+
+/// A patterns that is chained to another one.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ChainedPattern {
-    pub gap: RangeInclusive<u32>,
+    /// Distance or gap between this pattern and the other one that this
+    /// is chained to.
+    pub gap: ChainedPatternGap,
+    /// HIR tree representing the pattern.
     pub hir: Hir,
 }
 
@@ -56,7 +78,7 @@ impl From<regex_syntax::hir::Hir> for Hir {
 
 impl Hir {
     /// Pattern chaining is the process of splitting a pattern that contains very
-    /// large gaps (a.k.a jumps) into multiple pieces that are chained together.
+    /// large gaps (a.k.a. jumps) into multiple pieces that are chained together.
     ///
     /// For example, when matching the pattern `{ 01 02 03 [0-2000] 04 05 06 }` is
     /// more efficient if we split it into two patterns `{ 01 02 03}` and
@@ -67,7 +89,7 @@ impl Hir {
     /// Both `{ 01 02 03}` and `{ 04 05 06 }` are handled as if they were separate
     /// patterns, except that they are chained together.
     ///
-    /// [`PATTERN_CHAINING_THRESHOLD`] controls the how large the gap (or jump)
+    /// [`PATTERN_CHAINING_THRESHOLD`] controls how large the gap (or jump)
     /// must be in order split the pattern at that point. Gaps shorter than this
     /// value don't cause the splitting of the pattern.
     const PATTERN_CHAINING_THRESHOLD: u32 = 200;
@@ -133,7 +155,11 @@ impl Hir {
                         >= Self::MIN_PATTERN_LENGTH_IN_CHAIN
                     {
                         chain.push(ChainedPattern {
-                            gap: gap_min..=gap_max.unwrap_or(u32::MAX),
+                            gap: if let Some(gap_max) = gap_max {
+                                ChainedPatternGap::Bounded(gap_min..=gap_max)
+                            } else {
+                                ChainedPatternGap::Unbounded(gap_min..)
+                            },
                             hir,
                         });
                         gap_min = rep.min;
@@ -162,7 +188,11 @@ impl Hir {
                 >= Self::MIN_PATTERN_LENGTH_IN_CHAIN
         {
             chain.push(ChainedPattern {
-                gap: gap_min..=gap_max.unwrap_or(u32::MAX),
+                gap: if let Some(gap_max) = gap_max {
+                    ChainedPatternGap::Bounded(gap_min..=gap_max)
+                } else {
+                    ChainedPatternGap::Unbounded(gap_min..)
+                },
                 hir,
             });
         } else {
@@ -244,6 +274,15 @@ impl Hir {
             _ => false,
         }
     }
+
+    /// If the HIR represents a regular expression that can be reduced
+    /// to a literal sequence of bytes, returns the bytes.
+    pub fn as_literal_bytes(&self) -> Option<&[u8]> {
+        match self.inner.kind() {
+            HirKind::Literal(literal) => Some(literal.0.as_bytes()),
+            _ => None,
+        }
+    }
 }
 
 impl Hir {
@@ -281,7 +320,7 @@ struct HirHasher<'a, H: Hasher> {
     state: &'a mut H,
 }
 
-impl<'a, H: Hasher> regex_syntax::hir::Visitor for HirHasher<'a, H> {
+impl<H: Hasher> regex_syntax::hir::Visitor for HirHasher<'_, H> {
     type Output = ();
     type Err = ();
 
@@ -335,7 +374,7 @@ impl<'a, H: Hasher> regex_syntax::hir::Visitor for HirHasher<'a, H> {
 ///
 /// For example `??` in an hex pattern, or `.` in a regexp that uses the `/s`
 /// modifier (i.e: `dot_matches_new_line` is true).
-pub fn any_byte(hir_kind: &HirKind) -> bool {
+pub(crate) fn any_byte(hir_kind: &HirKind) -> bool {
     match hir_kind {
         HirKind::Class(Class::Bytes(class)) => {
             if let Some(range) = class.ranges().first() {
@@ -360,7 +399,7 @@ pub fn any_byte(hir_kind: &HirKind) -> bool {
 ///
 /// For example `.` in a regexp that doesn't use the `/s` modifier
 /// (i.e: `dot_matches_new_line` is false).
-pub fn any_byte_except_newline(hir_kind: &HirKind) -> bool {
+pub(crate) fn any_byte_except_newline(hir_kind: &HirKind) -> bool {
     match hir_kind {
         HirKind::Class(Class::Bytes(class)) => {
             // The class must contain two ranges, one that contains all bytes
@@ -390,7 +429,7 @@ pub fn any_byte_except_newline(hir_kind: &HirKind) -> bool {
 /// This function basically does the opposite than [`hex_byte_to_class`].
 /// However, not all the classes represent a masked byte, in such cases
 /// this function returns [`None`].
-pub fn class_to_masked_byte(c: &ClassBytes) -> Option<HexByte> {
+pub(crate) fn class_to_masked_byte(c: &ClassBytes) -> Option<HexByte> {
     if c.ranges().is_empty() {
         return None;
     }
@@ -437,7 +476,7 @@ pub fn class_to_masked_byte(c: &ClassBytes) -> Option<HexByte> {
     Some(HexByte { value: smallest_byte, mask: !neg_mask })
 }
 
-pub fn class_to_masked_bytes_alternation(
+pub(crate) fn class_to_masked_bytes_alternation(
     c: &ClassBytes,
 ) -> Option<Vec<HexByte>> {
     if c.ranges().is_empty() {
@@ -462,7 +501,7 @@ pub fn class_to_masked_bytes_alternation(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use super::Hir;
+    use super::{ChainedPatternGap, Hir};
     use crate::re::hir::ChainedPattern;
 
     #[test]
@@ -537,7 +576,7 @@ mod tests {
             (
                 Hir::literal([0x01, 0x02, 0x03]),
                 vec![ChainedPattern {
-                    gap: 0..=u32::MAX,
+                    gap: ChainedPatternGap::Unbounded(0..),
                     hir: Hir::concat(vec![
                         Hir::literal([0x05]),
                         Hir::any_byte_repetition(
@@ -584,7 +623,7 @@ mod tests {
             (
                 Hir::literal([0x01, 0x02, 0x03]),
                 vec![ChainedPattern {
-                    gap: 0..=u32::MAX,
+                    gap: ChainedPatternGap::Unbounded(0..),
                     hir: Hir::literal([0x04, 0x05])
                 },]
             )

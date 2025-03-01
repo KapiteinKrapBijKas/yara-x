@@ -53,7 +53,7 @@ solely matches the `0xAA` byte.
 
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
-use std::u8;
+use std::num::TryFromIntError;
 
 use bitvec::order::Lsb0;
 use bitvec::slice::{BitSlice, IterOnes};
@@ -85,7 +85,11 @@ impl Display for SplitId {
 }
 
 impl SplitId {
+    /// Number of bits in an SplitId.
     pub const BITS: usize = 13;
+
+    /// Maximum SplitId.
+    pub const MAX: usize = (1 << SplitId::BITS) - 1;
 
     #[inline]
     pub fn to_le_bytes(self) -> [u8; size_of::<Self>()] {
@@ -98,12 +102,12 @@ impl SplitId {
     }
 
     /// Add a given amount to the split id, returning [`None`] if the result
-    /// is exceeds the maximum allowed value, which depends on the number of
+    /// is exceeding the maximum allowed value, which depends on the number of
     /// bits indicated by [`SplitId::BITS`].
     #[inline]
     pub fn add(self, amount: u16) -> Option<Self> {
         let sum = self.0.checked_add(amount)?;
-        if sum >= 1 << Self::BITS {
+        if sum as usize > Self::MAX {
             return None;
         }
         Some(Self(sum))
@@ -112,7 +116,49 @@ impl SplitId {
 
 /// Offset for jump and split instructions. The offset is always relative to
 /// the address where the instruction starts.
-pub type Offset = i32;
+pub struct Offset(i32);
+
+impl From<Offset> for i32 {
+    #[inline]
+    fn from(value: Offset) -> Self {
+        value.0
+    }
+}
+
+impl From<Offset> for isize {
+    #[inline]
+    fn from(value: Offset) -> Self {
+        value.0 as isize
+    }
+}
+
+impl From<usize> for Offset {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self(i32::try_from(value).unwrap())
+    }
+}
+
+impl TryFrom<isize> for Offset {
+    type Error = TryFromIntError;
+
+    #[inline]
+    fn try_from(value: isize) -> Result<Self, Self::Error> {
+        Ok(Self(i32::try_from(value)?))
+    }
+}
+
+impl Offset {
+    #[inline]
+    pub fn from_le_bytes(bytes: [u8; size_of::<Self>()]) -> Offset {
+        Offset(i32::from_le_bytes(bytes))
+    }
+
+    #[inline]
+    pub fn to_le_bytes(&self) -> [u8; size_of::<Self>()] {
+        self.0.to_le_bytes()
+    }
+}
 
 /// Instructions supported by the Pike VM.
 pub enum Instr<'a> {
@@ -152,22 +198,44 @@ pub enum Instr<'a> {
     ClassRanges(ClassRanges<'a>),
 
     /// Creates a new thread that starts at the current instruction pointer
-    /// + offset while the current thread continues at the next instruction.
-    /// The name comes from the fact that this instruction splits the execution
-    /// flow in two.
+    /// plus an offset, while the current thread continues at the next
+    /// instruction. The name comes from the fact that this instruction splits
+    /// the execution flow in two.
     SplitA(SplitId, Offset),
 
     /// Similar to SplitA, but the current thread continues at instruction
-    /// pointer + offset while the new thread continues at the next instruction.
-    /// This difference is important because the newly created thread has lower
-    /// priority than the existing one, and priority affects the greediness of
-    /// the regular expression.
+    /// pointer plus an offset while the new thread continues at the next
+    /// instruction. This difference is important because the newly created
+    /// thread has lower priority than the existing one, and priority affects
+    /// the greediness of the regular expression.
     SplitB(SplitId, Offset),
 
     /// Continues executing the code at N different locations. The current
     /// thread continues at the first location, and N-1 newly created threads
     /// continue at the remaining locations.
     SplitN(SplitN<'a>),
+
+    /// Jumps back to the beginning of some repetition, continues with the
+    /// code that comes after the repetition, or both, depending on the
+    /// repetition count for the current thread and the minimum and maximum
+    /// number of repetitions indicated by `min` and `max`. The logic goes
+    /// as follows:
+    /// - If the repetition count for the current thread (`rep_count`) is
+    ///   less than `min`, only jumps to the beginning of the repetition as
+    ///   the minimum number of repetitions has not been reached yet.
+    /// - If `rep_count` is between `min` and `max`, the current thread jumps
+    ///   to the beginning of the repetition, and a new thread continues
+    ///   executing the code after the repetition.
+    /// - If `rep_count` reached `max`, the current thread continues executing
+    ///   the code after the repetition.
+    RepeatGreedy { offset: Offset, min: u32, max: u32 },
+
+    /// Similar to [`RepeatGreedy`], the only difference resides on the priority
+    /// of newly created threads vs the existing thread. In the greedy version
+    /// of this instruction going back to the start of the repetition has higher
+    /// priority, while for this instruction continuing with the code after the
+    /// repetition has higher priority.
+    RepeatNonGreedy { offset: Offset, min: u32, max: u32 },
 
     /// Relative jump. The opcode is followed by an offset, the location
     /// of the target instruction is computed by adding this offset to the
@@ -179,6 +247,20 @@ pub enum Instr<'a> {
 
     /// Matches the end of the scanned data ($).
     End,
+
+    /// Matches the start of the scanned data or the start of a line (^ in
+    /// multi-line mode). Specifically, this matches at the start of the
+    /// data, or at the position immediately before a \n character, a \r
+    /// character, or sequences \r\n and \n\r. It won't match in the middle
+    /// of \r\n or \n\r.
+    LineStart,
+
+    /// Matches the end of the scanned data or the end of a line ($ in
+    /// multi-line mode). Specifically, this matches at the end of the
+    /// data, or at the position immediately after a \n character, a \r
+    /// character, or sequences \r\n and \n\r. It won't match in the middle
+    /// of \r\n or \n\r.
+    LineEnd,
 
     /// Matches a word boundary (i.e: characters that are not part of the
     /// \w class). Used for \b look-around assertions. This is a zero-length
@@ -202,7 +284,7 @@ pub enum Instr<'a> {
     WordEnd,
 }
 
-impl<'a> Instr<'a> {
+impl Instr<'_> {
     pub const MATCH: u8 = 0x00;
     pub const SPLIT_A: u8 = 0x01;
     pub const SPLIT_B: u8 = 0x02;
@@ -219,6 +301,10 @@ impl<'a> Instr<'a> {
     pub const WORD_BOUNDARY_NEG: u8 = 0x0D;
     pub const WORD_START: u8 = 0x0E;
     pub const WORD_END: u8 = 0x0F;
+    pub const REPEAT_GREEDY: u8 = 0x10;
+    pub const REPEAT_NON_GREEDY: u8 = 0x11;
+    pub const LINE_START: u8 = 0x12;
+    pub const LINE_END: u8 = 0x13;
 }
 
 /// Parses a slice of bytes that contains Pike VM instructions, returning
@@ -286,6 +372,32 @@ impl<'a> InstrParser<'a> {
                         + size_of::<Offset>() * n as usize,
                 )
             }
+            [OPCODE_PREFIX, Instr::REPEAT_GREEDY, ..] => {
+                let offset = Self::decode_offset(&code[2..]);
+                let min = Self::decode_u32(&code[2 + size_of::<Offset>()..]);
+                let max = Self::decode_u32(
+                    &code[2 + size_of::<Offset>() + size_of::<u32>()..],
+                );
+                (
+                    Instr::RepeatGreedy { offset, min, max },
+                    2 + size_of::<Offset>()
+                        + size_of::<u32>()
+                        + size_of::<u32>(),
+                )
+            }
+            [OPCODE_PREFIX, Instr::REPEAT_NON_GREEDY, ..] => {
+                let offset = Self::decode_offset(&code[2..]);
+                let min = Self::decode_u32(&code[2 + size_of::<Offset>()..]);
+                let max = Self::decode_u32(
+                    &code[2 + size_of::<Offset>() + size_of::<u32>()..],
+                );
+                (
+                    Instr::RepeatNonGreedy { offset, min, max },
+                    2 + size_of::<Offset>()
+                        + size_of::<u32>()
+                        + size_of::<u32>(),
+                )
+            }
             [OPCODE_PREFIX, Instr::CLASS_RANGES, ..] => {
                 let n = *unsafe { code.get_unchecked(2) } as usize;
                 let ranges =
@@ -302,6 +414,8 @@ impl<'a> InstrParser<'a> {
             }
             [OPCODE_PREFIX, Instr::START, ..] => (Instr::Start, 2),
             [OPCODE_PREFIX, Instr::END, ..] => (Instr::End, 2),
+            [OPCODE_PREFIX, Instr::LINE_START, ..] => (Instr::LineStart, 2),
+            [OPCODE_PREFIX, Instr::LINE_END, ..] => (Instr::LineEnd, 2),
             [OPCODE_PREFIX, Instr::WORD_BOUNDARY, ..] => {
                 (Instr::WordBoundary, 2)
             }
@@ -317,6 +431,13 @@ impl<'a> InstrParser<'a> {
             [b, ..] => (Instr::Byte(b), 1),
             _ => unreachable!(),
         }
+    }
+
+    fn decode_u32(slice: &[u8]) -> u32 {
+        let bytes: &[u8; size_of::<u32>()] =
+            unsafe { &*(slice.as_ptr() as *const [u8; size_of::<u32>()]) };
+
+        u32::from_le_bytes(*bytes)
     }
 
     fn decode_offset(slice: &[u8]) -> Offset {
@@ -372,7 +493,7 @@ impl<'a> SplitN<'a> {
 
 pub struct SplitOffsets<'a>(&'a [u8]);
 
-impl<'a> Iterator for SplitOffsets<'a> {
+impl Iterator for SplitOffsets<'_> {
     type Item = Offset;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -387,7 +508,7 @@ impl<'a> Iterator for SplitOffsets<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for SplitOffsets<'a> {
+impl DoubleEndedIterator for SplitOffsets<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let len = self.0.len();
         if len < size_of::<Offset>() {
@@ -422,7 +543,7 @@ impl<'a> ClassRanges<'a> {
 
 pub struct Ranges<'a>(&'a [u8]);
 
-impl<'a> Iterator for Ranges<'a> {
+impl Iterator for Ranges<'_> {
     type Item = (u8, u8);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -455,7 +576,7 @@ impl<'a> ClassBitmap<'a> {
 
 /// Returns the length of the code emitted for the given literal.
 ///
-/// Usually the code emitted for a literal has the same length than the literal
+/// Usually the code emitted for a literal has the same length as the literal
 /// itself, because each byte in the literal corresponds to one byte in the
 /// code. However, this is not true if the literal contains one or more bytes
 /// equal to [`OPCODE_PREFIX`]. In such cases the code is longer than the

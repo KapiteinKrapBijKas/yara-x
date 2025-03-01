@@ -13,12 +13,64 @@ use protobuf::reflect::{EnumValueDescriptor, Syntax};
 use protobuf::MessageDyn;
 use serde::{Deserialize, Serialize};
 
+use crate::modules::protos::yara::enum_value_options::Value as EnumValue;
 use crate::modules::protos::yara::exts::{
     enum_options, enum_value, field_options, message_options, module_options,
 };
-use crate::symbols::{Symbol, SymbolKind, SymbolLookup};
+use crate::symbols::{Symbol, SymbolLookup};
 use crate::types::{Array, Map, TypeValue, Value};
 use crate::wasm::WasmExport;
+
+/// Each of the entries in an Access Control List (ACL)
+///
+/// When defining the structure of a module in a `.proto` file, you can specify
+/// that certain fields are accessible only when one or more features are
+/// enabled in the compiler with using [`crate::Compiler::enable_feature`]. For
+/// example, the field ``requires_foo_and_bar` in the snippet below has an ACL
+/// indicating that the field can be accessed only if features "foo" and "bar"
+/// are enabled in the compiler.
+///
+/// ```protobuf
+/// optional uint64 requires_foo_and_bar = 500 [
+///   (yara.field_options) = {
+///     acl: [
+///       {
+///         accept_if: "foo",
+///         error_title: "foo is required",
+///         error_label: "this field was used without foo"
+///       },
+///       {
+///         accept_if: "bar",
+///         error_title: "bar is required",
+///         error_label: "this field was used without bar"
+///       }
+///     ]
+///   }
+/// ];
+/// ```
+///
+/// If some of the required features are not enabled, using this field in
+/// a YARA rule will cause an error while compiling the rules. The error
+/// looks like:
+///
+/// ```text
+/// error[E034]: foo is required
+///  --> line:5:29
+///   |
+/// 5 |  test_proto2.requires_foo_and_bar == 0
+///   |              ^^^^^^^^^^^^^^^^^^^^ this field was used without foo
+///   |
+/// ```
+///
+/// Notice that both the title and label in the error message are defined
+/// in the .proto file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AclEntry {
+    pub error_title: String,
+    pub error_label: String,
+    pub accept_if: Vec<String>,
+    pub reject_if: Vec<String>,
+}
 
 /// A field in a [`Struct`].
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,6 +80,8 @@ pub(crate) struct StructField {
     pub number: u64,
     /// Field type and value.
     pub type_value: TypeValue,
+    /// Access control list (ACL) for accessing this struct field.
+    pub acl: Option<Vec<AclEntry>>,
 }
 
 /// A dynamic structure with one or more fields.
@@ -63,10 +117,12 @@ pub(crate) struct Struct {
 impl SymbolLookup for Struct {
     fn lookup(&self, ident: &str) -> Option<Symbol> {
         let (field, index) = self.field_and_index_by_name(ident)?;
-        Some(Symbol::new(
-            field.type_value.clone(),
-            SymbolKind::Field(index, self.is_root),
-        ))
+        Some(Symbol::Field {
+            index,
+            is_root: self.is_root,
+            type_value: field.type_value.clone(),
+            acl: field.acl.clone(),
+        })
     }
 }
 
@@ -117,6 +173,7 @@ impl Struct {
                 .or_insert_with(|| StructField {
                     type_value: TypeValue::Struct(Rc::new(Struct::new())),
                     number: 0,
+                    acl: None,
                 });
 
             if let TypeValue::Struct(ref mut s) = field.type_value {
@@ -132,8 +189,10 @@ impl Struct {
                 panic!("field `{}` is not a struct", &name[0..dot])
             }
         } else {
-            self.fields
-                .insert(name, StructField { type_value: value, number: 0 })
+            self.fields.insert(
+                name,
+                StructField { type_value: value, number: 0, acl: None },
+            )
         }
     }
 
@@ -162,10 +221,7 @@ impl Struct {
             } else {
                 format!("{}.{}", path, item.name())
             };
-            self.add_field(
-                field_name,
-                TypeValue::const_integer_from(Self::enum_value(&item)),
-            );
+            self.add_field(field_name, Self::enum_value(&item).into());
         }
     }
 
@@ -333,6 +389,7 @@ impl Struct {
                 StructField {
                     // Index is initially zero, will be adjusted later.
                     type_value: value,
+                    acl: Self::acl(&fd),
                     number,
                 },
             ));
@@ -460,13 +517,10 @@ impl Struct {
     /// Here the `Foo` structure will be named `Bar` when the protobuf is
     /// converted into a [`Struct`].
     fn message_name(msg_descriptor: &MessageDescriptor) -> String {
-        if let Some(options) =
-            message_options.get(&msg_descriptor.proto().options)
-        {
-            options.name.unwrap_or_else(|| msg_descriptor.name().to_owned())
-        } else {
-            msg_descriptor.name().to_owned()
-        }
+        message_options
+            .get(&msg_descriptor.proto().options)
+            .and_then(|options| options.name)
+            .unwrap_or_else(|| msg_descriptor.name().to_owned())
     }
 
     /// Given a [`EnumDescriptor`] returns the name that this enum will
@@ -486,13 +540,10 @@ impl Struct {
     ///
     /// Here the enum will be named `my_enum` instead of `Enumeration`.
     fn enum_name(enum_descriptor: &EnumDescriptor) -> String {
-        if let Some(options) =
-            enum_options.get(&enum_descriptor.proto().options)
-        {
-            options.name.unwrap_or_else(|| enum_descriptor.name().to_owned())
-        } else {
-            enum_descriptor.name().to_owned()
-        }
+        enum_options
+            .get(&enum_descriptor.proto().options)
+            .and_then(|options| options.name)
+            .unwrap_or_else(|| enum_descriptor.name().to_owned())
     }
 
     /// Given a [`EnumDescriptor`] returns whether this enum is declared as
@@ -528,13 +579,10 @@ impl Struct {
     /// in the enum are added directly as fields of the module, or the struct
     /// that contains the enum.
     fn enum_is_inline(enum_descriptor: &EnumDescriptor) -> bool {
-        if let Some(options) =
-            enum_options.get(&enum_descriptor.proto().options)
-        {
-            options.inline.unwrap_or(false)
-        } else {
-            false
-        }
+        enum_options
+            .get(&enum_descriptor.proto().options)
+            .and_then(|options| options.inline)
+            .unwrap_or(false)
     }
 
     /// Given a [`EnumValueDescriptor`] returns the value associated to that
@@ -551,8 +599,8 @@ impl Struct {
     /// }
     /// ```
     ///
-    /// In this enum the value of `ITEM_0` is 0, and the value of `ITEM_1` is
-    /// 1. The tag number associated to each item determines its value. However
+    /// In this enum the value of `ITEM_0` is 0 and the value of `ITEM_1` is 1.
+    /// The tag number associated to each item determines its value. However,
     /// this approach has one limitation, tag number are of type `i32` and
     /// therefore they are limited to the range `-2147483648,2147483647`. For
     /// larger values you need to use the second approach:
@@ -565,21 +613,28 @@ impl Struct {
     /// ```
     ///
     /// In this other case tag number are maintained because they are required
-    /// in every protobuf enum, however, the value associated to each items is
+    /// in every protobuf enum, however, the value associated to each item is
     /// not determined by the field number, but by the `(yara.enum_value).i64`
     /// option.
+    ///
+    /// By using `(yara.enum_value).f64` you can specify a float value. For
+    /// instance:
+    ///
+    /// enum Constants {
+    ///   PI = 0  [(yara.enum_value).f64 = 3.141592];
+    ///   TAU = 1  [(yara.enum_value).i64 = 6.283186];
+    /// }
     ///
     /// What this function returns is the value associated to an enum item,
     /// returning the value set via the `(yara.enum_value).i64` option, if any,
     /// or the tag number.
-    fn enum_value(enum_value_descriptor: &EnumValueDescriptor) -> i64 {
-        if let Some(options) =
-            enum_value.get(&enum_value_descriptor.proto().options)
-        {
-            options.i64.unwrap_or_else(|| enum_value_descriptor.value() as i64)
-        } else {
-            enum_value_descriptor.value() as i64
-        }
+    fn enum_value(enum_value_descriptor: &EnumValueDescriptor) -> EnumValue {
+        enum_value
+            .get(&enum_value_descriptor.proto().options)
+            .and_then(|options| options.value)
+            .unwrap_or_else(|| {
+                EnumValue::I64(enum_value_descriptor.value() as i64)
+            })
     }
 
     /// Given a [`FieldDescriptor`] returns the name that this field will
@@ -596,13 +651,10 @@ impl Struct {
     /// Here the `foo` field will be named `bar` when the protobuf is converted
     /// into a [`Struct`].
     fn field_name(field_descriptor: &FieldDescriptor) -> String {
-        if let Some(options) =
-            field_options.get(&field_descriptor.proto().options)
-        {
-            options.name.unwrap_or_else(|| field_descriptor.name().to_owned())
-        } else {
-            field_descriptor.name().to_owned()
-        }
+        field_options
+            .get(&field_descriptor.proto().options)
+            .and_then(|options| options.name)
+            .unwrap_or_else(|| field_descriptor.name().to_owned())
     }
 
     /// Given a [`FieldDescriptor`] returns `true` if the field should be
@@ -615,13 +667,35 @@ impl Struct {
     /// int64 foo = 1 [(yara.field_options).ignore = true];
     /// ```
     fn ignore_field(field_descriptor: &FieldDescriptor) -> bool {
-        if let Some(options) =
-            field_options.get(&field_descriptor.proto().options)
-        {
-            options.ignore.unwrap_or(false)
-        } else {
-            false
-        }
+        field_options
+            .get(&field_descriptor.proto().options)
+            .and_then(|options| options.ignore)
+            .unwrap_or(false)
+    }
+
+    /// Given a [`FieldDescriptor`] returns the Access Control List (ACL)
+    /// associated to that field.
+    ///
+    /// See [`AclEntry`] for details.
+    fn acl(field_descriptor: &FieldDescriptor) -> Option<Vec<AclEntry>> {
+        field_options
+            .get(&field_descriptor.proto().options)
+            .map(|options| options.acl)
+            .filter(|acl| !acl.is_empty())
+            .map(|acl| {
+                acl.into_iter()
+                    .map(|entry| AclEntry {
+                        accept_if: entry.accept_if,
+                        reject_if: entry.reject_if,
+                        error_title: entry
+                            .error_title
+                            .expect("the `error_title` field is required"),
+                        error_label: entry
+                            .error_label
+                            .expect("the `error_label` field is required"),
+                    })
+                    .collect()
+            })
     }
 
     /// Given a protobuf type and value returns a [`TypeValue`].

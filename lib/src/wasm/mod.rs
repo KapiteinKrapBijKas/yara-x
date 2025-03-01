@@ -27,16 +27,16 @@ The memory of these WASM modules is organized as follows.
 ```text
   ┌──────────────────────────┐ 0
   │ Variable undefined flags │
-  ├──────────────────────────┤ 16
-  │ Variable #0              │ 24
-  │ Variable #1              │ 32
+  ├──────────────────────────┤ VARS_STACK_START
+  │ Variable #0              │
+  │ Variable #1              │
   : ...                      :
   │ Variable #n              │
   : ...                      :
   │                          │
-  ├──────────────────────────┤ 1032
+  ├──────────────────────────┤ LOOKUP_INDEXES_START
   │ Field lookup indexes     │
-  ├──────────────────────────┤ 2056
+  ├──────────────────────────┤ MATCHING_RULES_BITMAP_BASE
   │ Matching rules bitmap    │
   │                          │
   :                          :
@@ -71,8 +71,8 @@ indexes: the index of `some_module` within the global structure, the index
 of `some_struct` within `some_module`, and finally the index of `some_int`,
 within `some_struct`. These indexes are stored starting at offset 1024 in
 the WASM module's main memory (see "Memory layout") before calling
-[`lookup_integer`], while the global variable `lookup_num_lookup_indexes` says how
-many indexes to lookup.
+[`lookup_integer`], while the global variable `lookup_num_lookup_indexes` says
+how many indexes to lookup.
 
 See the [`lookup_field`] function.
 
@@ -94,20 +94,24 @@ use yara_x_macros::wasm_export;
 
 use crate::compiler::{LiteralId, PatternId, RegexpId, RuleId};
 use crate::modules::BUILTIN_MODULES;
-use crate::scanner::{RuntimeObjectHandle, ScanContext};
+use crate::scanner::{RuntimeObjectHandle, ScanContext, ScanError};
 use crate::types::{
     Array, Func, FuncSignature, Map, Struct, TypeValue, Value,
 };
 use crate::wasm::string::RuntimeString;
-use crate::ScanError;
 
 pub(crate) mod builder;
 pub(crate) mod string;
 
-/// Offset in module's main memory where the space for loop variables start.
-pub(crate) const VARS_STACK_START: i32 = 16;
-/// Offset in module's main memory where the space for loop variables end.
-pub(crate) const VARS_STACK_END: i32 = VARS_STACK_START + 1024;
+/// Maximum number of variables.
+pub(crate) const MAX_VARS: i32 = 2048;
+/// Offset in module's main memory where the space for variables start.
+/// The space that goes from 0 to VARS_STACK_START is dedicated to the flags
+/// that indicate whether a variable is undefined. That's why this space
+/// is MAX_VARS / 8 bytes, we only need a bit per variable.
+pub(crate) const VARS_STACK_START: i32 = MAX_VARS / 8;
+/// Offset in module's main memory where the space for variables end.
+pub(crate) const VARS_STACK_END: i32 = VARS_STACK_START + MAX_VARS * 8;
 
 /// Offset in module's main memory where the space for lookup indexes start.
 pub(crate) const LOOKUP_INDEXES_START: i32 = VARS_STACK_END;
@@ -132,10 +136,10 @@ pub(crate) struct WasmExport {
     pub name: &'static str,
     /// Function's mangled name. The mangled name contains information about
     /// the function's arguments and return type. For additional details see
-    /// [`yara_x_parser::types::MangledFnName`].
+    /// [`crate::types::MangledFnName`].
     pub mangled_name: &'static str,
     /// True if the function is visible from YARA rules. Functions exported by
-    /// modules, as well as built-in functions like uint8, uint16, etc are
+    /// modules, as well as built-in functions like uint8, uint16, etc, are
     /// public, but many other functions callable from WASM are for internal
     /// use only and therefore are not public.
     pub public: bool,
@@ -599,6 +603,7 @@ fn type_id_to_wasmtime(
 /// and implements the [`WasmExportedFn`] trait for them.
 macro_rules! impl_wasm_exported_fn {
     ($name:ident $($args:ident)*) => {
+        #[allow(dead_code)]
         pub(super) struct $name <$($args,)* R>
         where
             $($args: 'static,)*
@@ -610,6 +615,7 @@ macro_rules! impl_wasm_exported_fn {
                           + 'static),
         }
 
+        #[allow(dead_code)]
         impl<$($args,)* R> WasmExportedFn for $name<$($args,)* R>
         where
             $(ValRaw: WasmArg<$args>,)*
@@ -678,10 +684,9 @@ pub(crate) struct WasmSymbols {
     /// The WASM module's main memory.
     pub main_memory: walrus::MemoryId,
 
-    /// Global variable that contains the offset within the module's main
-    /// memory where resides the bitmap that indicates if a pattern matches
-    /// or not.
-    pub matching_patterns_bitmap_base: walrus::GlobalId,
+    /// Function that checks if a pattern matched or not. This function
+    /// receives the pattern ID and returns a boolean.
+    pub check_for_pattern_match: walrus::FunctionId,
 
     /// Global variable that contains the value for `filesize`.
     pub filesize: walrus::GlobalId,
@@ -693,12 +698,9 @@ pub(crate) struct WasmSymbols {
     /// evaluated and some of them needs to know if a pattern matched or not.
     pub pattern_search_done: walrus::GlobalId,
 
-    /// Global variable that is set to true when a timeout during the scanning
-    /// phase.
-    pub timeout_occurred: walrus::GlobalId,
-
     /// Local variables used for temporary storage.
-    pub i64_tmp: walrus::LocalId,
+    pub i64_tmp_a: walrus::LocalId,
+    pub i64_tmp_b: walrus::LocalId,
     pub i32_tmp: walrus::LocalId,
     pub f64_tmp: walrus::LocalId,
 }
@@ -706,8 +708,41 @@ pub(crate) struct WasmSymbols {
 lazy_static! {
     pub(crate) static ref CONFIG: Config = {
         let mut config = Config::default();
+        // Wasmtime produces a nasty warning when linked against musl. The
+        // warning can be fixed by disabling native unwind information.
+        //
+        // More details:
+        //
+        // https://github.com/bytecodealliance/wasmtime/issues/8897
+        // https://github.com/VirusTotal/yara-x/issues/181
+        //
+        #[cfg(target_env = "musl")]
+        config.native_unwind_info(false);
+
         config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
         config.epoch_interruption(true);
+
+        // 16MB should be enough for each WASM module. Each module needs a
+        // fixed amount of memory that is only a few KB long, plus a variable
+        // amount that depends on the number of rules and patterns (1 bit per
+        // rule and 1 bit per pattern). With 16MB there's enough space for
+        // millions of rules and patterns. By default, this is 4GB in 64-bits
+        // systems, which causes a reservation of 4GB of virtual address space
+        // (not physical RAM) per module (and therefore per Scanner). In some
+        // scenarios where virtual address space is limited (i.e: Docker
+        // instances) this is problematic. See:
+        // https://github.com/VirusTotal/yara-x/issues/292
+        config.memory_reservation(0x1000000);
+
+        // WASM memory won't grow, there's no need to allocate space for
+        // future grow.
+        config.memory_reservation_for_growth(0);
+
+        // As the memory can't grow, it won't move. By explicitly indicating
+        // this, modules can be compiled with static knowledge the base pointer
+        // of linear memory never changes to enable optimizations.
+        config.memory_may_move(false);
+
         config
     };
     pub(crate) static ref ENGINE: Engine = Engine::new(&CONFIG).unwrap();
@@ -739,18 +774,6 @@ pub(crate) fn new_linker<'r>() -> Linker<ScanContext<'r>> {
     linker
 }
 
-/// Invoked from WASM before starting the evaluation of the rule identified
-/// by the given [`RuleId`]. This only happens when the "logging" feature is
-/// enabled.
-#[wasm_export]
-#[cfg(feature = "logging")]
-pub(crate) fn log_rule_eval_start(
-    caller: &mut Caller<'_, ScanContext>,
-    rule_id: RuleId,
-) {
-    caller.data_mut().log_rule_eval_start(rule_id);
-}
-
 /// Invoked from WASM for triggering the pattern search phase.
 ///
 /// Returns `true` on success and `false` when a timeout occurs.
@@ -774,13 +797,13 @@ pub(crate) fn rule_match(
     caller.data_mut().track_rule_match(rule_id);
 }
 
-/// Invoked from WASM to notify when a global rule doesn't match.
+/// Invoked from WASM to notify when a rule doesn't match.
 #[wasm_export]
-pub(crate) fn global_rule_no_match(
+pub(crate) fn rule_no_match(
     caller: &mut Caller<'_, ScanContext>,
     rule_id: RuleId,
 ) {
-    caller.data_mut().track_global_rule_no_match(rule_id);
+    caller.data_mut().track_rule_no_match(rule_id);
 }
 
 /// Invoked from WASM to ask whether a pattern matches at a given file
@@ -1097,7 +1120,7 @@ pub(crate) fn array_indexing_struct(
     _: &mut Caller<'_, ScanContext>,
     array: Rc<Array>,
     index: i64,
-) -> Option<Rc<Struct>> { 
+) -> Option<Rc<Struct>> {
     array
         .as_struct_array()
         .get(index as usize)
@@ -1450,10 +1473,8 @@ macro_rules! gen_xint_fn {
                 .data()
                 .scanned_data()
                 .get(offset..offset + mem::size_of::<$return_type>())
-                .map_or(None, |bytes| {
-                    let value =
-                        <$return_type>::$from_fn(bytes.try_into().unwrap());
-                    Some(value as i64)
+                .map(|bytes| {
+                    <$return_type>::$from_fn(bytes.try_into().unwrap()) as i64
                 })
         }
     };

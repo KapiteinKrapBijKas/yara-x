@@ -8,8 +8,10 @@ use crossterm::tty::IsTty;
 use superconsole::{Component, Line, Lines, Span};
 use yansi::Color::{Green, Red, Yellow};
 use yansi::Paint;
-use yara_x_parser::SourceCode;
+use yara_x::{linters, SourceCode};
+use yara_x_parser::ast::MetaValue;
 
+use crate::config::{CheckConfig, MetaValueType};
 use crate::walk::Message;
 use crate::{help, walk};
 
@@ -19,22 +21,24 @@ pub fn check() -> Command {
         // The `check` command is not ready yet.
         .hide(true)
         .long_about(help::CHECK_LONG_HELP)
+        // Keep options sorted alphabetically by their long name.
+        // For instance, --bar goes before --foo.
         .arg(
             arg!(<RULES_PATH>)
                 .help("Path to YARA source file or directory")
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
-            arg!(-d --"max-depth" <MAX_DEPTH>)
-                .help("Walk directories recursively up to a given depth")
-                .long_help(help::DEPTH_LONG_HELP)
-                .value_parser(value_parser!(u16)),
-        )
-        .arg(
             arg!(-f --filter <PATTERN>)
                 .help("Check files that match the given pattern only")
                 .long_help(help::FILTER_LONG_HELP)
                 .action(ArgAction::Append),
+        )
+        .arg(
+            arg!(-d --"max-depth" <MAX_DEPTH>)
+                .help("Walk directories recursively up to a given depth")
+                .long_help(help::DEPTH_LONG_HELP)
+                .value_parser(value_parser!(u16)),
         )
         .arg(
             arg!(-p --"threads" <NUM_THREADS>)
@@ -45,7 +49,22 @@ pub fn check() -> Command {
         )
 }
 
-pub fn exec_check(args: &ArgMatches) -> anyhow::Result<()> {
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_sha1(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_md5(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn exec_check(
+    args: &ArgMatches,
+    config: CheckConfig,
+) -> anyhow::Result<()> {
     let rules_path = args.get_one::<PathBuf>("RULES_PATH").unwrap();
     let max_depth = args.get_one::<u16>("max-depth");
     let filters = args.get_many::<String>("filter");
@@ -72,7 +91,9 @@ pub fn exec_check(args: &ArgMatches) -> anyhow::Result<()> {
 
     w.walk(
         CheckState::new(),
+        // Initialization
         |_, _| {},
+        // Action
         |state, output, file_path, _| {
             let src = fs::read(file_path.clone())
                 .with_context(|| {
@@ -85,6 +106,96 @@ pub fn exec_check(args: &ArgMatches) -> anyhow::Result<()> {
 
             let mut lines = Vec::new();
             let mut compiler = yara_x::Compiler::new();
+
+            for (identifier, config) in config.metadata.iter() {
+                let mut linter =
+                    linters::metadata(identifier)
+                        .required(config.required)
+                        .error(config.error);
+
+                match config.ty {
+                    MetaValueType::String => {
+                        linter = linter.validator(
+                            |meta| {
+                                matches!(
+                                    meta.value,
+                                    MetaValue::String(_) | MetaValue::Bytes(_)
+                                )
+                            },
+                            format!("`{identifier}` must be a string"),
+                        );
+                    }
+                    MetaValueType::Integer => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::Integer(_)),
+                            format!("`{identifier}` must be an integer"),
+                        );
+                    }
+                    MetaValueType::Float => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::Float(_)),
+                            format!("`{identifier}` must be a float"),
+                        );
+                    }
+                    MetaValueType::Bool => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::Bool(_)),
+                            format!("`{identifier}` must be a bool"),
+                        );
+                    }
+                    MetaValueType::Sha256 => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::String((s,_)) if is_sha256(s)),
+                            format!("`{identifier}` must be a SHA-256"),
+                        );
+                    }
+                    MetaValueType::Sha1 => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::String((s,_)) if is_sha1(s)),
+                            format!("`{identifier}` must be a SHA-1"),
+                        );
+                    }
+                    MetaValueType::MD5 => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::String((s,_)) if is_md5(s)),
+                            format!("`{identifier}` must be a MD5"),
+                        );
+                    }
+                    MetaValueType::Hash => {
+                        linter = linter.validator(
+                            |meta| matches!(meta.value, MetaValue::String((s,_))
+                                if is_md5(s) || is_sha1(s) || is_sha256(s)),
+                            format!("`{identifier}` must be a MD5, SHA-1 or SHA-256"),
+                        );
+                    }
+                }
+
+                compiler.add_linter(linter);
+            }
+
+            if let Some(re) = config
+                .rule_name
+                .regexp
+                .as_ref()
+                .filter(|re| !re.is_empty()) {
+                compiler.add_linter(
+                    linters::rule_name(re)?.error(config.rule_name.error));
+            }
+
+            // Prefer allowed list over the regex, as it is more explicit.
+            if !config.tags.allowed.is_empty() {
+                compiler.add_linter(
+                    linters::tags_allowed(config.tags.allowed.clone())
+                    .error(config.tags.error));
+            } else if let Some(re) = config
+                .tags
+                .regexp
+                .as_ref()
+                .filter(|re| !re.is_empty()) {
+                compiler.add_linter(
+                    linters::tag_regex(re)?.error(config.tags.error)
+                );
+            }
 
             compiler.colorize_errors(io::stdout().is_tty());
 
@@ -107,8 +218,8 @@ pub fn exec_check(args: &ArgMatches) -> anyhow::Result<()> {
                             "WARN".paint(Yellow).bold(),
                             file_path.display()
                         ));
-                        for warning in compiler.warnings().iter() {
-                            lines.push(warning.to_string());
+                        for warning in compiler.warnings() {
+                            eprintln!("{}", warning);
                         }
                     }
                 }
@@ -127,6 +238,11 @@ pub fn exec_check(args: &ArgMatches) -> anyhow::Result<()> {
 
             Ok(())
         },
+        // Finalization
+        |_, _| {},
+        // Walk done
+        |_| {},
+        // Error handling
         |err, output| {
             let _ = output.send(Message::Error(format!(
                 "{} {}",

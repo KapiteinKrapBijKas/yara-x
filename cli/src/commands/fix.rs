@@ -23,24 +23,26 @@ pub fn fix() -> Command {
 pub fn fix_encoding() -> Command {
     super::command("encoding")
         .about("Convert source files to UTF-8")
-        .long_about(help::FIX_ENCODING_HELP)
+        .long_about(help::FIX_ENCODING_LONG_HELP)
         .arg(
             arg!(<RULES_PATH>)
                 .help("Path to YARA source file or directory")
                 .value_parser(value_parser!(PathBuf)),
         )
+        // Keep options sorted alphabetically by their long name.
+        // For instance, --bar goes before --foo.
         .arg(arg!(-d - -"dry-run").help("Don't modify source files"))
-        .arg(
-            arg!(-d --"max-depth" <MAX_DEPTH>)
-                .help("Walk directories recursively up to a given depth")
-                .long_help(help::DEPTH_LONG_HELP)
-                .value_parser(value_parser!(u16)),
-        )
         .arg(
             arg!(-f --filter <PATTERN>)
                 .help("Check files that match the given pattern only")
                 .long_help(help::FILTER_LONG_HELP)
                 .action(ArgAction::Append),
+        )
+        .arg(
+            arg!(-d --"max-depth" <MAX_DEPTH>)
+                .help("Walk directories recursively up to a given depth")
+                .long_help(help::DEPTH_LONG_HELP)
+                .value_parser(value_parser!(u16)),
         )
         .arg(
             arg!(-p --"threads" <NUM_THREADS>)
@@ -86,7 +88,9 @@ pub fn exec_fix_encoding(args: &ArgMatches) -> anyhow::Result<()> {
 
     w.walk(
         FixEncodingState::new(),
+        // Initialization
         |_, _| {},
+        // Action
         |state, output, file_path, _| {
             let src = fs::read(&file_path).with_context(|| {
                 format!("can not read `{}`", file_path.display())
@@ -120,6 +124,11 @@ pub fn exec_fix_encoding(args: &ArgMatches) -> anyhow::Result<()> {
 
             Ok(())
         },
+        // Finalization
+        |_, _| {},
+        // Walk done
+        |_| {},
+        // Error handling
         |err, output| {
             let _ = output.send(Message::Error(format!(
                 "{} {}",

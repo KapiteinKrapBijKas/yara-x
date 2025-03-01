@@ -55,21 +55,40 @@ macro_rules! condition_false {
 }
 
 macro_rules! test_rule {
-    ($rule:expr,  $data:expr, $expected_result:expr) => {{
+    // Helper macro to avoid repetition
+    (__impl $rule:expr, $data:expr, $metadata:expr, $expected_result:expr) => {{
         let rules = crate::compile($rule).unwrap();
 
-        let num_matching_rules = crate::scanner::Scanner::new(&rules)
-            .scan($data)
+        let mut scanner = crate::scanner::Scanner::new(&rules);
+
+        let mut scan_options = crate::ScanOptions::new();
+
+        for (module_name, meta) in $metadata {
+            scan_options = scan_options.set_module_metadata(module_name, meta);
+        }
+
+        let num_matching_rules = scanner
+            .scan_with_options($data, scan_options)
             .expect("scan should not fail")
             .matching_rules()
             .len();
 
         assert_eq!(
             num_matching_rules, $expected_result as usize,
-            "\n\n`{}` should be {}, but it is {}",
-            $rule, $expected_result, !$expected_result
+            "\n\n`{}` expected {} rule(s) to match, but {} did",
+            $rule, $expected_result, num_matching_rules
         );
     }};
+
+    ($rule:expr, $data:expr, $metadata:expr, $expected_result:expr) => {{
+        let arcd_meta = ($metadata).map(|(name, meta)| (name, std::sync::Arc::<[u8]>::from(meta.to_vec())));
+        test_rule!(__impl $rule, $data, arcd_meta.as_ref(), $expected_result);
+    }};
+
+    ($rule:expr, $data:expr, $expected_result:expr) => {{
+        test_rule!(__impl $rule, $data, [] /* no metadata */, $expected_result);
+    }};
+
     ($rule:expr) => {{
         rule_true!($rule, &[]);
     }};
@@ -262,10 +281,26 @@ fn string_operations() {
     condition_true!(r#""foo" matches /foo/"#);
     condition_true!(r#""foo" matches /FOO/i"#);
     condition_false!(r#""foo" matches /bar/"#);
+
+    condition_true!(r#""xxfooxx" matches /foo/"#);
+    condition_false!(r#""xxfooxx" matches /^foo/"#);
+    condition_false!(r#""xxfooxx" matches /\Afoo/i"#);
+    condition_false!(r#""xxfooxx" matches /foo$/"#);
+
     condition_true!(r#""xxFoOxx" matches /fOo/i"#);
     condition_false!(r#""xxFoOxx" matches /^fOo/i"#);
+    condition_false!(r#""xxFoOxx" matches /\AfOo/i"#);
     condition_false!(r#""xxFoOxx" matches /fOo$/i"#);
+
     condition_true!(r#""foobar" matches /^foo/"#);
+    condition_false!(r#""bar\nfoo" matches /^foo/"#);
+    condition_false!(r#""bar\nfoo" matches /\Afoo/"#);
+
+    // (?m) enables the multi-line mode, in that mode ^ matches the start of
+    // a line, but \A matches the start of the haystack only.
+    condition_true!(r#""bar\nfoo" matches /(?m)^foo/"#);
+    condition_false!(r#""bar\nfoo" matches /(?m)\Afoo/"#);
+
     condition_true!(r#""foobar" matches /bar$/"#);
     condition_true!(r#""foobar" matches /^foobar$/"#);
     condition_true!(r#""foo\nbar" matches /foo.*bar/s"#);
@@ -492,6 +527,169 @@ fn for_in() {
     #[cfg(feature = "test_proto2-module")]
     condition_true!(
         r#"for any i in (test_proto2.int64_undef, 0, 1) : (i == 1)"#
+    );
+}
+
+#[test]
+fn with() {
+    condition_true!(r#"with foo = 1 + 1 : (foo == 2)"#);
+    condition_false!(r#"with foo = 1 + 1 : (foo == 3)"#);
+    condition_true!(r#"with foo = 1 + 1, bar = 2 + 2 : (foo + bar == 6)"#);
+    condition_false!(r#"with foo = 1 + 1, bar = 2 + 2 : (foo + bar == 7)"#);
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(r#"with foo = test_proto2.array_int64[0]: (foo == 1)"#);
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(r#"with foo = test_proto2.array_int64: (foo[0] == 1)"#);
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_false!(
+        r#"with foo = test_proto2.array_int64[test_proto2.int64_zero]: (foo == 10)"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with foo = test_proto2.map_string_struct["foo"].nested_int64_one: (foo == 1)"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with foo = test_proto2.map_string_struct: (foo["foo"].nested_int64_one== 1)"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with foo = test_proto2.nested: (foo.nested_int64_one == 1 )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_false!(
+        r#"with foo = test_proto2.nested: (foo.nested_int64_one == 0 )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with foo = test_proto2.uppercase("foo"): (foo == "FOO" )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_false!(
+        r#"with foo = test_proto2.uppercase("foo"): (foo == "FoO" )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_false!(r#"with foo = test_proto2.undef_i64(): (foo == 1)"#);
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"not defined with foo = test_proto2.undef_i64(): (foo == 1)"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with
+              foo = test_proto2.undef_i64(),
+              bar = 1 :
+           (
+              not defined foo and bar == 1
+           )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with
+              bar = test_proto2.array_string[1],
+              baz = test_proto2.array_string[2]:
+           (
+              bar == "bar" and baz == "baz"
+           )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"for any i in (0..1): (
+             with foo = test_proto2.array_int64[i]: (foo == 1)
+           )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"for all i in (0..0): (
+             with
+                foo = test_proto2.array_int64[i],
+                bar = test_proto2.array_int64[i + 1] :
+             (
+                foo == 1 and bar == 10
+             )
+           )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_false!(
+        r#"for all i in (0..2): (
+            with
+               foo = test_proto2.array_int64[i],
+               bar = test_proto2.array_int64[i + 1] :
+            (
+               foo == 1 and bar == foo * 10
+            )
+        )"#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with foo = test_proto2.add:
+           (
+              foo(1,2) == 3
+           )
+        "#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with one = test_proto2.int32_one:
+           (
+             for any i in (0..1) : (
+               i == one and test_proto2.add(1,2) == 3 and test_proto2.float_zero + 1 == 1.0
+             )
+             and for any j in (0..1) : (
+               test_proto2.add(1,2) != 0 and test_proto2.float_zero + 1 == 1.0
+             )
+          )
+        "#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with one = test_proto2.int32_one : (
+             with nested = one : (
+                nested == 1
+             )
+           )
+        "#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with t = test_proto2 : (
+             with nested = t : (
+                nested.int32_one == 1
+             )
+           )
+        "#
+    );
+
+    #[cfg(feature = "test_proto2-module")]
+    condition_true!(
+        r#"with one = test_proto2.int32_one,
+                two = test_proto2.add(one, 1),
+                three = two + 1: (
+             one == 1 and
+             two == 2 and
+             three == 3
+           )
+        "#
     );
 }
 
@@ -1153,6 +1351,74 @@ fn regexp_patterns_2() {
 
 #[test]
 fn regexp_patterns_3() {
+    pattern_match!(r#"/.b{15}/"#, b"abbbbbbbbbbbbbbb", b"abbbbbbbbbbbbbbb");
+    pattern_match!(
+        r#"/.b{15,16}/"#,
+        b"abbbbbbbbbbbbbbbb",
+        b"abbbbbbbbbbbbbbbb"
+    );
+    pattern_match!(
+        r#"/.b{15,16}?/"#,
+        b"abbbbbbbbbbbbbbbb",
+        b"abbbbbbbbbbbbbbb"
+    );
+    pattern_match!(
+        r#"/ab{15,16}?c/"#,
+        b"abbbbbbbbbbbbbbbc",
+        b"abbbbbbbbbbbbbbbc"
+    );
+    pattern_match!(
+        r#"/.b{15,16}cccc/"#,
+        b"abbbbbbbbbbbbbbbbcccc",
+        b"abbbbbbbbbbbbbbbbcccc"
+    );
+    pattern_match!(
+        r#"/.b{15,16}?cccc/"#,
+        b"abbbbbbbbbbbbbbbcccc",
+        b"abbbbbbbbbbbbbbbcccc"
+    );
+    pattern_match!(
+        r#"/a.b{15,16}cccc/"#,
+        b"aabbbbbbbbbbbbbbbcccc",
+        b"aabbbbbbbbbbbbbbbcccc"
+    );
+    pattern_match!(
+        r#"/abcd.{0,11}efgh.{0,11}ijk/"#,
+        b"abcd123456789ABefgh123456789ABijk",
+        b"abcd123456789ABefgh123456789ABijk"
+    );
+    pattern_match!(
+        r#"/abcd.{0,11}?efgh.{0,11}?ijk/"#,
+        b"abcd123456789ABefgh123456789ABijk",
+        b"abcd123456789ABefgh123456789ABijk"
+    );
+    pattern_match!(r#"/abcd.{0,11}?abcd/"#, b"abcdabcdabcd", b"abcdabcd");
+    pattern_match!(r#"/abcd.{0,11}abcd/"#, b"abcdabcdabcd", b"abcdabcdabcd");
+    pattern_match!(r#"/ab{2,15}c/"#, b"abbbc", b"abbbc");
+    pattern_match!(r#"/ab{2,15}?c/"#, b"abbbc", b"abbbc");
+    pattern_match!(r#"/ab{0,15}?c/"#, b"abc", b"abc");
+    pattern_match!(r#"/ab{,15}?c/"#, b"abc", b"abc");
+    pattern_match!(r#"/a{0,15}bc/"#, b"bbc", b"bc");
+    pattern_match!(r#"/a{0,15}?bc/"#, b"abc", b"abc");
+    pattern_match!(r#"/a{0,15}?bc/"#, b"bc", b"bc");
+    pattern_match!(r#"/aa{0,15}?bc/"#, b"abc", b"abc");
+    pattern_match!(r#"/aa{0,15}bc/"#, b"abc", b"abc");
+    pattern_match!(r#"/ab{11}c/"#, b"abbbbbbbbbbbc", b"abbbbbbbbbbbc");
+    pattern_false!(r#"/ab{11}c/"#, b"ac");
+    pattern_match!(r#"/ab{11,}c/"#, b"abbbbbbbbbbbbc", b"abbbbbbbbbbbbc");
+    pattern_false!(r#"/ab{11,}b/"#, b"abbbbbbbbbbb");
+    pattern_match!(r#"/ab{0,11}c/"#, b"abbbbbbbbbc", b"abbbbbbbbbc");
+    pattern_match!(r#"/(a{2,13}b){2,13}/"#, b"aabaaabaab", b"aabaaabaab");
+    pattern_match!(r#"/(a{2,13}?b){2,13}?/"#, b"aabaaabaab", b"aabaaab");
+    pattern_match!(
+        r#"/(a{4,5}b){4,15}/"#,
+        b"aaaabaaaabaaaaabaaaaab",
+        b"aaaabaaaabaaaaabaaaaab"
+    );
+}
+
+#[test]
+fn regexp_patterns_4() {
     pattern_match!(r#"/a[bx]c/"#, b"abc", b"abc");
     pattern_match!(r#"/a[bx]c/"#, b"axc", b"axc");
     pattern_match!(r#"/a[0-9]*b/"#, b"ab", b"ab");
@@ -1250,6 +1516,34 @@ fn regexp_patterns_3() {
     pattern_match!(r#"/whatever|   x.   x/"#, b"   xy   x", b"   xy   x");
     pattern_match!(r#"/^abc/"#, b"abc", b"abc");
     pattern_match!(r#"/^abc/"#, b"abcd", b"abc");
+    pattern_false!(r#"/^abc/"#, b"xyz\nabc");
+    pattern_false!(r#"/^abc/"#, b"xyz\rabc");
+    pattern_false!(r#"/^abc/"#, b"xyz\r\nabc");
+    pattern_false!(r#"/^abc/"#, b"xyz\n\rabc");
+    pattern_false!(r#"/abc$/"#, b"abc\nxyz");
+    pattern_false!(r#"/abc$/"#, b"abc\rxyz");
+
+    pattern_match!(r#"/(?m)^abc/"#, b"xyz\nabc", b"abc");
+    pattern_match!(r#"/(?m)^abc/"#, b"xyz\rabc", b"abc");
+    pattern_match!(r#"/(?m)^abc/"#, b"xyz\n\rabc", b"abc");
+    pattern_match!(r#"/(?m)^abc/"#, b"xyz\r\nabc", b"abc");
+    pattern_match!(r#"/(?m)^\nabc/"#, b"xyz\n\nabc", b"\nabc");
+
+    pattern_false!(r#"/(?m)abcd^xyz/"#, b"abcdxyz");
+    pattern_match!(r#"/(?ms)abcd.^xyz/"#, b"abcd\nxyz", b"abcd\nxyz");
+
+    pattern_match!(r#"/(?m)abc$/"#, b"abc\nxyz", b"abc");
+    pattern_match!(r#"/(?m)abc$/"#, b"abc\rxyz", b"abc");
+    pattern_match!(r#"/(?m)abc$/"#, b"abc\n\rxyz", b"abc");
+    pattern_match!(r#"/(?m)abc$/"#, b"abc\r\nxyz", b"abc");
+    pattern_match!(r#"/(?m)abc\n$/"#, b"abc\n\nxyz", b"abc\n");
+
+    pattern_false!(r#"/(?m)xyz$abcd/"#, b"xyzabcd");
+    pattern_match!(r#"/(?ms)xyz$.abcd/"#, b"xyz\nabcd", b"xyz\nabcd");
+
+    pattern_match!(r#"/\Aabc/"#, b"abcd", b"abc");
+    pattern_match!(r#"/bcd\z/"#, b"abcd", b"bcd");
+    pattern_false!(r#"/^def/"#, b"abcdef");
     pattern_false!(r#"/abc^/"#, b"abc");
     pattern_false!(r#"/ab^c/"#, b"abc");
     pattern_false!(r#"/a^bcdef/"#, b"abcdef");
@@ -1273,7 +1567,8 @@ fn regexp_patterns_3() {
 }
 
 #[test]
-fn regexp_patterns_4() {
+fn regexp_patterns_5() {
+    pattern_match!(r"/\\/", b"\\", b"\\");
     pattern_match!(r"/\babc/", b"abc", b"abc");
     pattern_match!(r"/abc\b/", b"abc", b"abc");
     pattern_false!(r"/\babc/", b"1abc");
@@ -1342,7 +1637,7 @@ fn regexp_patterns_4() {
 }
 
 #[test]
-fn regexp_patterns_5() {
+fn regexp_patterns_6() {
     rule_true!(
         r#"rule test {
             strings:
@@ -1560,6 +1855,7 @@ fn regexp_wide() {
     pattern_true!(r"/foobar\B/ wide", b"f\x00o\x00o\x00b\x00a\x00r\x00x\x00");
     pattern_true!(r"/foobar\b/ wide", b"f\x00o\x00o\x00b\x00a\x00r\x00x");
     pattern_false!(r"/foobar\B/ wide", b"f\x00o\x00o\x00b\x00a\x00r\x00x");
+    pattern_true!(r"/foobar$/ wide", b"f\x00o\x00o\x00b\x00a\x00r\x00");
     pattern_true!(r"/foobar$/ wide", b"f\x00o\x00o\x00b\x00a\x00r\x00x");
 }
 
@@ -1796,7 +2092,7 @@ fn match_at() {
             condition:
                 $a at 0
         }
-        
+
         rule test2 {
             strings:
                 $a = "bar"
@@ -2185,7 +2481,7 @@ fn match_offset() {
                 // the result must be undefined. We use test_proto2.add(0,0)
                 // because using a literal causes a compilation error when
                 // the compiler notices that the index is 0.
-                not defined @a[test_proto2.add(0,0)] 
+                not defined @a[test_proto2.add(0,0)]
         }
         "#,
         b"foo"
@@ -2281,7 +2577,7 @@ fn match_length() {
                 // the result must be undefined. We use test_proto2.add(0,0)
                 // because using a literal causes a compilation error when
                 // the compiler notices that the index is 0.
-                not defined !a[test_proto2.add(0,0)] 
+                not defined !a[test_proto2.add(0,0)]
         }
         "#,
         b"foo"
@@ -2416,7 +2712,8 @@ fn fullword() {
     pattern_true!(r#"/miss|ippi/ fullword"#, b"miss issippi");
     pattern_true!(r#"/miss|ippi/ fullword"#, b"mississ ippi");
 
-    pattern_true!("/^mississippi/ fullword", b"mississippi\tmississippi");
+    pattern_true!("/^mississippi/ fullword", b"mississippi\tfoo");
+    pattern_true!("/mississippi$/ fullword", b"foo\tmississippi");
 
     pattern_true!(
         r#""mississippi" wide fullword"#,

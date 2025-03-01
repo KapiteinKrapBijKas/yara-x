@@ -3,9 +3,13 @@ use protobuf::MessageDyn;
 use protobuf::{Message, MessageFull};
 use serde_json::json;
 
-use crate::mods;
-use crate::scanner::{MetaValue, Scanner};
+#[cfg(feature = "rules-profiling")]
+use std::time::Duration;
+
+use crate::models::MetaValue;
 use crate::variables::VariableError;
+use crate::Scanner;
+use crate::{mods, ScanOptions};
 
 #[test]
 fn iterators() {
@@ -52,7 +56,7 @@ fn matches() {
                 $c = "baz"
             condition:
                 any of them
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -90,7 +94,7 @@ fn metadata() {
                 quux = "qu\x00x"
             condition:
                 true
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -138,7 +142,7 @@ fn xor_matches() {
                 $a = "mississippi" xor
             condition:
                 $a
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -172,7 +176,7 @@ fn reuse_scanner() {
         rule test {
             condition:
                 test_proto2.file_size == 3
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -214,7 +218,7 @@ fn module_output() {
         rule test {
             condition:
                 test_proto2.file_size == 3
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -241,7 +245,7 @@ fn module_outputs() {
         rule test {
             condition:
                 test_proto2.file_size == 3
-        } 
+        }
         "#,
     )
     .unwrap();
@@ -250,6 +254,8 @@ fn module_outputs() {
     let scan_results = scanner.scan(b"").expect("scan should not fail");
 
     let mut outputs = scan_results.module_outputs();
+
+    assert_eq!(outputs.len(), 1);
 
     let (name, output) = outputs
         .next()
@@ -276,7 +282,7 @@ fn variables_1() {
         rule test {
             condition:
             bool_var
-        } 
+        }
         "#,
         )
         .unwrap();
@@ -346,7 +352,7 @@ fn variables_2() {
             condition:
                 some_bool and
                 some_str == "foo"
-        } 
+        }
         "#,
         )
         .unwrap();
@@ -401,10 +407,15 @@ fn global_rules() {
     compiler
         .add_source(
             r#"
+        // This rule is always true.
+        private rule const_true {
+            condition:
+                true
+        }
         // This global rule doesn't affect the results because it's true.
         global rule global_true {
             condition:
-                true
+                const_true
         }
         // Even if the condition is true, this rule doesn't match because of
         // the false global rule that follows.
@@ -424,7 +435,7 @@ fn global_rules() {
         .new_namespace("matching")
         .add_source(
             r#"
-            // This rule matches because it is in separate namespace not 
+            // This rule matches because it is in separate namespace not
             // which is not affected by the global rule.
             rule matching {
                 condition:
@@ -616,4 +627,88 @@ fn set_module_output() {
         .unwrap();
     let scan_results = scanner.scan(b"").expect("scan should not fail");
     assert_eq!(scan_results.matching_rules().len(), 1);
+}
+
+#[test]
+fn namespaces() {
+    let mut compiler = crate::Compiler::new();
+
+    compiler
+        .new_namespace("foo")
+        .add_source(r#"rule foo {strings: $foo = "foo" condition: $foo }"#)
+        .unwrap()
+        .new_namespace("bar")
+        .add_source(r#"rule bar {strings: $bar = "bar" condition: $bar }"#)
+        .unwrap();
+
+    let rules = compiler.build();
+    let mut scanner = Scanner::new(&rules);
+    let scan_results = scanner.scan(b"foobar").expect("scan should not fail");
+    let matching_rules: Vec<_> = scan_results.matching_rules().collect();
+
+    assert_eq!(matching_rules.len(), 2);
+    assert_eq!(matching_rules[0].identifier(), "foo");
+    assert_eq!(matching_rules[0].namespace(), "foo");
+    assert_eq!(matching_rules[1].identifier(), "bar");
+    assert_eq!(matching_rules[1].namespace(), "bar");
+}
+
+#[test]
+fn scan_file() {
+    let rules = crate::compile(
+        r#"
+    rule slow {
+      strings:
+        $a = "aaaa"
+      condition: 
+        $a
+    }
+    "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+    let scan_results =
+        scanner.scan_file("src/tests/testdata/jumps.bin").unwrap();
+
+    assert_eq!(scan_results.matching_rules().len(), 1);
+
+    let scan_results = scanner
+        .scan_file_with_options(
+            "src/tests/testdata/jumps.bin",
+            ScanOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(scan_results.matching_rules().len(), 1)
+}
+
+#[cfg(feature = "rules-profiling")]
+#[test]
+fn rules_profiling() {
+    let rules = crate::compile(
+        r#"
+    rule slow {
+      condition: 
+        for any i in (0..1000000) : (
+           uint8(i) == 0xCC
+        )
+    }
+    "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+
+    scanner.scan(b"foobar").unwrap();
+
+    let slowest_rules = scanner.slowest_rules(10);
+
+    assert_eq!(slowest_rules.len(), 1);
+    assert!(slowest_rules[0].condition_exec_time.gt(&Duration::from_secs(0)));
+
+    scanner.clear_profiling_data();
+
+    let slowest_rules = scanner.slowest_rules(10);
+    assert_eq!(slowest_rules.len(), 0);
 }

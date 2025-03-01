@@ -199,11 +199,21 @@ impl<'a> Walker<'a> {
         F: FnMut(&Path) -> anyhow::Result<()>,
         E: FnMut(anyhow::Error) -> anyhow::Result<()>,
     {
-        let path = match self.path.canonicalize() {
-            Ok(path) => path,
-            Err(err) => {
-                return e(err.into());
-            }
+        // Strip the ./ prefix (.\ in Windows), if present. Except for ".",
+        // "./" and ".\". This is a workaround for a bug in globwalk that
+        // causes a panic.
+        // https://github.com/VirusTotal/yara-x/issues/280
+        // https://github.com/Gilnaa/globwalk/issues/28
+        let path = if self.path.as_os_str().len() > 2 {
+            self.path
+                .strip_prefix(if cfg!(target_os = "windows") {
+                    r#".\"#
+                } else {
+                    "./"
+                })
+                .unwrap_or(self.path)
+        } else {
+            self.path
         };
 
         let mut builder = if self.filters.is_empty() {
@@ -221,7 +231,7 @@ impl<'a> Walker<'a> {
             builder = builder.max_depth(max_depth + 1);
         }
 
-        for entry in builder.build().unwrap() {
+        for entry in builder.build()? {
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
@@ -312,6 +322,11 @@ impl<'a> Walker<'a> {
 ///     |state, output, file_path, scanner| {
 ///         scanner.scan_file(file_path);
 ///     }
+///     /// This function is called by each thread after every file is
+///     /// scanned.
+///     |scanner| {
+///         // Do some final action with the scanner before it is released.
+///     }
 ///     // This function is called with every error that occurs during the
 ///     // walk.
 ///     |err, output| {
@@ -376,23 +391,27 @@ impl<'a> ParWalker<'a> {
         self
     }
 
-    /// Runs `func` on every file.
+    /// Runs `action` on every file.
     ///
     /// See [`ParWalker`] for details.
-    pub fn walk<S, T, I, F, E>(
+    pub fn walk<S, T, I, A, F, D, E>(
         self,
         state: S,
         init: I,
-        func: F,
-        e: E,
+        action: A,
+        finalize: F,
+        on_walk_done: D,
+        error: E,
     ) -> thread::Result<()>
     where
-        S: Component + Send + Sync,
+        S: Component + Send + Sync + 'static,
         I: Fn(&S, &Sender<Message>) -> T + Send + Copy + Sync,
-        F: Fn(&S, &Sender<Message>, PathBuf, &mut T) -> anyhow::Result<()>
+        A: Fn(&S, &Sender<Message>, PathBuf, &mut T) -> anyhow::Result<()>
             + Send
             + Sync
             + Copy,
+        F: Fn(&T, &Sender<Message>) + Send + Copy + Sync,
+        D: Fn(&Sender<Message>),
         E: Fn(anyhow::Error, &Sender<Message>) -> anyhow::Result<()>
             + Send
             + Copy,
@@ -429,19 +448,20 @@ impl<'a> ParWalker<'a> {
                 threads.push(s.spawn(move |_| {
                     let mut per_thread_obj = init(&state, &msg_send);
                     for path in paths_recv {
-                        let res = func(
+                        let res = action(
                             &state,
                             &msg_send,
                             path.to_path_buf(),
                             &mut per_thread_obj,
                         );
                         if let Err(err) = res {
-                            if e(err, &msg_send).is_err() {
+                            if error(err, &msg_send).is_err() {
                                 let _ = msg_send.send(Message::Abort);
                                 break;
                             }
                         }
                     }
+                    finalize(&per_thread_obj, &msg_send);
                 }));
             }
 
@@ -459,7 +479,7 @@ impl<'a> ParWalker<'a> {
 
                         // Invoke the error callback and abort the walk if the
                         // callback returns error.
-                        if let Err(err) = e(err, &msg_send) {
+                        if let Err(err) = error(err, &msg_send) {
                             let _ = msg_send.send(Message::Abort);
                             return Err(err);
                         }
@@ -470,7 +490,7 @@ impl<'a> ParWalker<'a> {
                 );
 
                 if let Err(err) = res {
-                    if e(err, &msg_send).is_err() {
+                    if error(err, &msg_send).is_err() {
                         let _ = msg_send.send(Message::Abort);
                     }
                 }
@@ -490,53 +510,94 @@ impl<'a> ParWalker<'a> {
 
             // The console is rendered once every `render_period`.
             let render_period = Duration::from_secs_f64(0.150);
-            let mut last_render = Instant::now();
 
-            loop {
-                match msg_recv.recv_timeout(render_period) {
-                    Ok(Message::Info(s)) => {
-                        if let Some(console) = console.as_mut() {
-                            console.emit(
-                                Lines::from_colored_multiline_string(
-                                    s.as_str(),
-                                ),
-                            );
-                        } else {
-                            println!("{}", s)
-                        }
-                    }
-                    Ok(Message::Error(s)) => {
-                        if let Some(console) = console.as_mut() {
-                            console.emit(
-                                Lines::from_colored_multiline_string(
-                                    s.as_str(),
-                                ),
-                            );
-                        } else {
-                            eprintln!("{}", s)
-                        }
-                    }
-                    Ok(Message::Abort) => {
-                        break;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        break;
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
+            output_messages(
+                render_period,
+                Instant::now(),
+                msg_recv,
+                console.as_mut(),
+                state.clone(),
+            );
+
+            threads.into_iter().for_each(|thread| thread.join().unwrap());
+
+            let (msg_send, msg_recv) =
+                crossbeam::channel::bounded::<Message>(32);
+
+            let handle = thread::spawn(move || {
+                output_messages(
+                    render_period,
+                    Instant::now(),
+                    msg_recv,
+                    console.as_mut(),
+                    state.clone(),
+                );
+
+                if let Some(console) = console {
+                    console.finalize(state.as_ref()).unwrap();
                 }
+            });
 
-                if let Some(console) = console.as_mut() {
-                    if Instant::elapsed(&last_render) > render_period {
-                        console.render(state.as_ref()).unwrap();
-                        last_render = Instant::now();
-                    }
-                }
-            }
+            // let `on_walk_done` send messages to the console
+            on_walk_done(&msg_send);
 
-            if let Some(console) = console {
-                console.finalize(state.as_ref()).unwrap();
-            }
+            // close the channel *before* joining the thread (`handle.join()`)
+            // this sends a signal through the channel to the listening threads to disconnect
+            // otherwise, trying to `handle.join()` will cause a deadlock
+            std::mem::drop(msg_send);
+
+            handle.join().unwrap();
         })
+    }
+}
+
+fn output_messages<S>(
+    render_period: Duration,
+    last_render: Instant,
+    msg_recv: crossbeam::channel::Receiver<Message>,
+    console: Option<&mut SuperConsole>,
+    state: Arc<S>,
+) where
+    S: Component,
+{
+    let mut console = console;
+    let mut last_render = last_render;
+
+    loop {
+        match msg_recv.recv_timeout(render_period) {
+            Ok(Message::Info(s)) => {
+                if let Some(console) = console.as_mut() {
+                    console.emit(Lines::from_colored_multiline_string(
+                        s.as_str(),
+                    ));
+                } else {
+                    println!("{}", s)
+                }
+            }
+            Ok(Message::Error(s)) => {
+                if let Some(console) = console.as_mut() {
+                    console.emit(Lines::from_colored_multiline_string(
+                        s.as_str(),
+                    ));
+                } else {
+                    eprintln!("{}", s)
+                }
+            }
+            Ok(Message::Abort) => {
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        if let Some(console) = console.as_mut() {
+            if Instant::elapsed(&last_render) > render_period {
+                console.render(state.as_ref()).unwrap();
+                last_render = Instant::now();
+            }
+        }
     }
 }
 

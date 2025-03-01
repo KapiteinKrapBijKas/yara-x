@@ -12,11 +12,14 @@ homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bitmask = { workspace = true }
+bitflags = { workspace = true }
+bstr = { workspace = true }
 lazy_static = { workspace = true }
 thiserror = { workspace = true }
 yara-x-parser = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
+globwalk = { workspace = true }
+goldenfile = { workspace = true }
 pretty_assertions = { workspace = true }
+rayon = { workspace = true }

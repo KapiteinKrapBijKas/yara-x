@@ -7,6 +7,7 @@
 
 use crate::modules::prelude::*;
 use crate::modules::protos::macho::*;
+use bstr::BString;
 use itertools::Itertools;
 use md5::{Digest, Md5};
 
@@ -266,11 +267,60 @@ fn has_rpath(ctx: &ScanContext, rpath: RuntimeString) -> Option<bool> {
     Some(false)
 }
 
-/// Returns an md5 hash of the dylibs designated in the mach-o binary
+/// Returns true if the Mach-O parsed imports contain `import`
+///
+/// `import` is case-insensitive
+#[module_export]
+fn has_import(ctx: &ScanContext, import: RuntimeString) -> Option<bool> {
+    let macho = ctx.module_output::<Macho>()?;
+    let expected_import = import.as_bstr(ctx);
+
+    for im in macho.imports.iter() {
+        if expected_import.eq_ignore_ascii_case(im.as_bytes()) {
+            return Some(true);
+        }
+    }
+
+    for file in macho.file.iter() {
+        for im in file.imports.iter() {
+            if expected_import.eq_ignore_ascii_case(im.as_bytes()) {
+                return Some(true);
+            }
+        }
+    }
+
+    Some(false)
+}
+
+/// Returns true if the Mach-O parsed exports contain `export`
+///
+/// `export` is case-insensitive
+#[module_export]
+fn has_export(ctx: &ScanContext, export: RuntimeString) -> Option<bool> {
+    let macho = ctx.module_output::<Macho>()?;
+    let expected_export = export.as_bstr(ctx);
+
+    for ex in macho.exports.iter() {
+        if expected_export.eq_ignore_ascii_case(ex.as_bytes()) {
+            return Some(true);
+        }
+    }
+
+    for file in macho.file.iter() {
+        for ex in file.exports.iter() {
+            if expected_export.eq_ignore_ascii_case(ex.as_bytes()) {
+                return Some(true);
+            }
+        }
+    }
+
+    Some(false)
+}
+
+/// Returns a md5 hash of the dylibs designated in the mach-o binary
 #[module_export]
 fn dylib_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
     let macho = ctx.module_output::<Macho>()?;
-    let mut md5_hash = Md5::new();
     let mut dylibs_to_hash = &macho.dylibs;
 
     // if there are not any dylibs in the main Macho, the dylibs of the nested
@@ -284,15 +334,15 @@ fn dylib_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
         return None;
     }
 
-    let dylibs_to_hash: String = dylibs_to_hash
+    let mut md5_hash = Md5::new();
+
+    let dylibs_to_hash = dylibs_to_hash
         .iter()
-        .filter_map(|d| {
-            Some(
-                String::from_utf8(d.name.clone()?)
-                    .unwrap()
-                    .trim()
-                    .to_lowercase(),
-            )
+        .filter_map(|dylib| {
+            dylib
+                .name
+                .as_ref()
+                .map(|name| BString::new(name.trim().to_lowercase()))
         })
         .unique()
         .sorted()
@@ -304,23 +354,24 @@ fn dylib_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
     Some(RuntimeString::new(digest))
 }
 
-/// Returns an md5 hash of the entitlements designated in the mach-o binary
+/// Returns a md5 hash of the entitlements designated in the mach-o binary
 #[module_export]
 fn entitlement_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
     let macho = ctx.module_output::<Macho>()?;
-    let mut md5_hash = Md5::new();
     let mut entitlements_to_hash = &macho.entitlements;
 
-    // if there are not any entitlements in the main Macho, the dylibs of the
+    // if there are not any entitlements in the main Macho, the entitlements of the
     // nested file should be hashed
     if entitlements_to_hash.is_empty() && !macho.file.is_empty() {
         entitlements_to_hash = &macho.file[0].entitlements;
     }
 
-    // we need to check again as the nested file dylibs could be empty too
+    // we need to check again as the nested file entitlements could be empty too
     if entitlements_to_hash.is_empty() {
         return None;
     }
+
+    let mut md5_hash = Md5::new();
 
     let entitlements_str: String = entitlements_to_hash
         .iter()
@@ -335,9 +386,105 @@ fn entitlement_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
     Some(RuntimeString::new(digest))
 }
 
+/// Returns a md5 hash of the export symbols in the mach-o binary
+#[module_export]
+fn export_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
+    let macho = ctx.module_output::<Macho>()?;
+    let mut exports_to_hash = &macho.exports;
+
+    // if there are not any exports in the main Macho, the exports of the
+    // nested file should be hashed
+    if exports_to_hash.is_empty() && !macho.file.is_empty() {
+        exports_to_hash = &macho.file[0].exports;
+    }
+
+    // we need to check again as the nested file exports could be empty too
+    if exports_to_hash.is_empty() {
+        return None;
+    }
+
+    let mut md5_hash = Md5::new();
+
+    let exports_str: String = exports_to_hash
+        .iter()
+        .map(|e| e.trim().to_lowercase())
+        .unique()
+        .sorted()
+        .join(",");
+
+    md5_hash.update(exports_str.as_bytes());
+
+    let digest = format!("{:x}", md5_hash.finalize());
+    Some(RuntimeString::new(digest))
+}
+
+/// Returns a md5 hash of the imported symbols in the mach-o binary
+#[module_export]
+fn import_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
+    let macho = ctx.module_output::<Macho>()?;
+    let mut imports_to_hash = &macho.imports;
+
+    // if there are not any imports in the main Macho, the imports of the
+    // nested file should be hashed
+    if imports_to_hash.is_empty() && !macho.file.is_empty() {
+        imports_to_hash = &macho.file[0].imports;
+    }
+
+    // we need to check again as the nested file imports could be empty too
+    if imports_to_hash.is_empty() {
+        return None;
+    }
+
+    let mut md5_hash = Md5::new();
+
+    let imports_str: String = imports_to_hash
+        .iter()
+        .map(|e| e.trim().to_lowercase())
+        .unique()
+        .sorted()
+        .join(",");
+
+    md5_hash.update(imports_str.as_bytes());
+
+    let digest = format!("{:x}", md5_hash.finalize());
+    Some(RuntimeString::new(digest))
+}
+
+/// Returns a md5 hash of the symbol table in the mach-o binary
+#[module_export]
+fn sym_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
+    let macho = ctx.module_output::<Macho>()?;
+    let mut symtab_to_hash = &macho.symtab.entries;
+
+    // if there is not a symbtol table in the main Macho, the symbol table of the
+    // nested file should be hashed
+    if symtab_to_hash.is_empty() && !macho.file.is_empty() {
+        symtab_to_hash = &macho.file[0].symtab.entries;
+    }
+
+    // we need to check again as the nested symbol table could be empty too
+    if symtab_to_hash.is_empty() {
+        return None;
+    }
+
+    let mut md5_hash: digest::core_api::CoreWrapper<md5::Md5Core> = Md5::new();
+
+    let symtab_hash_entries = symtab_to_hash
+        .iter()
+        .map(|e| BString::new(e.trim().to_lowercase()))
+        .unique()
+        .sorted()
+        .join(",");
+
+    md5_hash.update(symtab_hash_entries);
+
+    let digest = format!("{:x}", md5_hash.finalize());
+    Some(RuntimeString::new(digest))
+}
+
 #[module_main]
-fn main(input: &[u8]) -> Macho {
-    match parser::MachO::parse(input) {
+fn main(data: &[u8], _meta: Option<&[u8]>) -> Macho {
+    match parser::MachO::parse(data) {
         Ok(macho) => macho.into(),
         Err(_) => Macho::new(),
     }

@@ -1,6 +1,11 @@
-use crate::{LAST_ERROR, YRX_RESULT, YRX_RULES};
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CStr};
 use std::mem;
+use std::mem::ManuallyDrop;
+
+use yara_x::errors::{CompileError, SerializationError, VariableError};
+use yara_x::SourceCode;
+
+use crate::{_yrx_set_last_error, YRX_BUFFER, YRX_RESULT, YRX_RULES};
 
 /// A compiler that takes YARA source code and produces compiled rules.
 pub struct YRX_COMPILER<'a> {
@@ -27,13 +32,36 @@ pub const YRX_COLORIZE_ERRORS: u32 = 1;
 /// constructs that YARA-X doesn't accept by default.
 pub const YRX_RELAXED_RE_SYNTAX: u32 = 2;
 
+/// Flag passed to [`yrx_compiler_create`] for treating slow patterns as
+/// errors instead of warnings.
+pub const YRX_ERROR_ON_SLOW_PATTERN: u32 = 4;
+
+/// Flag passed to [`yrx_compiler_create`] for treating slow loops as
+/// errors instead of warnings.
+pub const YRX_ERROR_ON_SLOW_LOOP: u32 = 8;
+
+/// Flag passed to [`yrx_compiler_create`] for enabling optimizations.
+/// With this flag the compiler tries to optimize rule conditions by applying
+/// techniques like common subexpression elimination (CSE) and loop-invariant
+/// code motion (LICM).
+pub const YRX_ENABLE_CONDITION_OPTIMIZATION: u32 = 16;
+
 fn _yrx_compiler_create<'a>(flags: u32) -> yara_x::Compiler<'a> {
     let mut compiler = yara_x::Compiler::new();
     if flags & YRX_RELAXED_RE_SYNTAX != 0 {
         compiler.relaxed_re_syntax(true);
     }
+    if flags & YRX_ENABLE_CONDITION_OPTIMIZATION != 0 {
+        compiler.condition_optimization(true);
+    }
     if flags & YRX_COLORIZE_ERRORS != 0 {
         compiler.colorize_errors(true);
+    }
+    if flags & YRX_ERROR_ON_SLOW_PATTERN != 0 {
+        compiler.error_on_slow_pattern(true);
+    }
+    if flags & YRX_ERROR_ON_SLOW_LOOP != 0 {
+        compiler.error_on_slow_loop(true);
     }
     compiler
 }
@@ -66,6 +94,23 @@ pub unsafe extern "C" fn yrx_compiler_add_source(
     compiler: *mut YRX_COMPILER,
     src: *const c_char,
 ) -> YRX_RESULT {
+    yrx_compiler_add_source_with_origin(compiler, src, std::ptr::null())
+}
+
+/// Adds a YARA source code to be compiled, specifying an origin for the
+/// source code.
+///
+/// This function is similar to [`yrx_compiler_add_source`], but in addition
+/// to the source code itself it provides a string that identifies the origin
+/// of the code, usually the file path from where the source was obtained.
+///
+/// This origin is shown in error reports.
+#[no_mangle]
+pub unsafe extern "C" fn yrx_compiler_add_source_with_origin(
+    compiler: *mut YRX_COMPILER,
+    src: *const c_char,
+    origin: *const c_char,
+) -> YRX_RESULT {
     let compiler = if let Some(compiler) = compiler.as_mut() {
         compiler
     } else {
@@ -73,14 +118,23 @@ pub unsafe extern "C" fn yrx_compiler_add_source(
     };
 
     let src = CStr::from_ptr(src);
+    let mut src = SourceCode::from(src.to_bytes());
 
-    match compiler.inner.add_source(src.to_bytes()) {
+    if !origin.is_null() {
+        let origin = CStr::from_ptr(origin);
+        src = match origin.to_str() {
+            Ok(origin) => src.with_origin(origin),
+            Err(_) => return YRX_RESULT::INVALID_ARGUMENT,
+        };
+    }
+
+    match compiler.inner.add_source(src) {
         Ok(_) => {
-            LAST_ERROR.set(None);
+            _yrx_set_last_error::<CompileError>(None);
             YRX_RESULT::SUCCESS
         }
         Err(err) => {
-            LAST_ERROR.set(Some(CString::new(err.to_string()).unwrap()));
+            _yrx_set_last_error(Some(err));
             YRX_RESULT::SYNTAX_ERROR
         }
     }
@@ -110,6 +164,119 @@ pub unsafe extern "C" fn yrx_compiler_ignore_module(
     };
 
     compiler.inner.ignore_module(module);
+
+    YRX_RESULT::SUCCESS
+}
+
+/// Enables a feature on this compiler.
+///
+/// When defining the structure of a module in a `.proto` file, you can
+/// specify that certain fields are accessible only when one or more
+/// features are enabled. For example, the snippet below shows the
+/// definition of a field named `requires_foo_and_bar`, which can be
+/// accessed only when both features "foo" and "bar" are enabled.
+///
+/// ```protobuf
+/// optional uint64 requires_foo_and_bar = 500 [
+///   (yara.field_options) = {
+///     acl: [
+///       {
+///         allow_if: "foo",
+///         error_title: "foo is required",
+///         error_label: "this field was used without foo"
+///       },
+///       {
+///         allow_if: "bar",
+///         error_title: "bar is required",
+///         error_label: "this field was used without bar"
+///       }
+///     ]
+///   }
+/// ];
+/// ```
+///
+/// If some of the required features are not enabled, using this field in
+/// a YARA rule will cause an error while compiling the rules. The error
+/// looks like:
+///
+/// ```text
+/// error[E034]: foo is required
+///  --> line:5:29
+///   |
+/// 5 |  test_proto2.requires_foo_and_bar == 0
+///   |              ^^^^^^^^^^^^^^^^^^^^ this field was used without foo
+///   |
+/// ```
+///
+/// Notice that both the title and label in the error message are defined
+/// in the .proto file.
+///
+/// # Important
+///
+/// This API is hidden from the public documentation because it is unstable
+/// and subject to change.
+#[no_mangle]
+pub unsafe extern "C" fn yrx_compiler_enable_feature(
+    compiler: *mut YRX_COMPILER,
+    feature: *const c_char,
+) -> YRX_RESULT {
+    let compiler = if let Some(compiler) = compiler.as_mut() {
+        compiler
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    let feature = if let Ok(module) = CStr::from_ptr(feature).to_str() {
+        module
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    compiler.inner.enable_feature(feature);
+
+    YRX_RESULT::SUCCESS
+}
+
+/// Tell the compiler that a YARA module can't be used.
+///
+/// Import statements for the banned module will cause an error. The error
+/// message can be customized by using the given error title and message.
+///
+/// If this function is called multiple times with the same module name,
+/// the error title and message will be updated.
+#[no_mangle]
+pub unsafe extern "C" fn yrx_compiler_ban_module(
+    compiler: *mut YRX_COMPILER,
+    module: *const c_char,
+    error_title: *const c_char,
+    error_msg: *const c_char,
+) -> YRX_RESULT {
+    let compiler = if let Some(compiler) = compiler.as_mut() {
+        compiler
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    let module = if let Ok(module) = CStr::from_ptr(module).to_str() {
+        module
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    let err_title = if let Ok(err_title) = CStr::from_ptr(error_title).to_str()
+    {
+        err_title
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    let err_msg = if let Ok(err_msg) = CStr::from_ptr(error_msg).to_str() {
+        err_msg
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    compiler.inner.ban_module(module, err_title, err_msg);
 
     YRX_RESULT::SUCCESS
 }
@@ -151,7 +318,7 @@ pub unsafe extern "C" fn yrx_compiler_new_namespace(
 /// scanning data, however each scanner can change the variable’s initial
 /// value by calling `yrx_scanner_set_global`.
 unsafe fn yrx_compiler_define_global<
-    T: TryInto<yara_x::Variable, Error = yara_x::VariableError>,
+    T: TryInto<yara_x::Variable, Error = yara_x::errors::VariableError>,
 >(
     compiler: *mut YRX_COMPILER,
     ident: *const c_char,
@@ -171,11 +338,11 @@ unsafe fn yrx_compiler_define_global<
 
     match compiler.inner.define_global(ident, value) {
         Ok(_) => {
-            LAST_ERROR.set(None);
+            _yrx_set_last_error::<VariableError>(None);
             YRX_RESULT::SUCCESS
         }
         Err(err) => {
-            LAST_ERROR.set(Some(CString::new(err.to_string()).unwrap()));
+            _yrx_set_last_error(Some(err));
             YRX_RESULT::VARIABLE_ERROR
         }
     }
@@ -227,6 +394,138 @@ pub unsafe extern "C" fn yrx_compiler_define_global_float(
     yrx_compiler_define_global(compiler, ident, value)
 }
 
+/// Returns the errors encountered during the compilation in JSON format.
+///
+/// In the address indicated by the `buf` pointer, the function will copy a
+/// `YRX_BUFFER*` pointer. The `YRX_BUFFER` structure represents a buffer
+/// that contains the JSON representation of the compilation errors.
+///
+/// The JSON consists on an array of objects, each object representing a
+/// compilation error. The object has the following fields:
+///
+/// * type: A string that describes the type of error.
+/// * code: Error code (e.g: "E009").
+/// * title: Error title (e.g: "unknown identifier `foo`").
+/// * labels: Array of labels.
+/// * text: The full text of the error report, as shown by the command-line tool.
+///
+/// Here is an example:
+///
+/// ```json
+/// [
+///     {
+///         "type": "UnknownIdentifier",
+///         "code": "E009",
+///         "title": "unknown identifier `foo`",
+///         "labels": [
+///             {
+///                 "level": "error",
+///                 "code_origin": null,
+///                 "span": {"start":25,"end":28},
+///                 "text": "this identifier has not been declared"
+///             }
+///         ],
+///         "text": "... <full report here> ..."
+///     }
+/// ]
+/// ```
+///
+/// The [`YRX_BUFFER`] must be destroyed with [`yrx_buffer_destroy`].
+#[no_mangle]
+pub unsafe extern "C" fn yrx_compiler_errors_json(
+    compiler: *mut YRX_COMPILER,
+    buf: &mut *mut YRX_BUFFER,
+) -> YRX_RESULT {
+    let compiler = if let Some(compiler) = compiler.as_mut() {
+        compiler
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    match serde_json::to_vec(compiler.inner.errors()) {
+        Ok(json) => {
+            let json = json.into_boxed_slice();
+            let mut json = ManuallyDrop::new(json);
+            *buf = Box::into_raw(Box::new(YRX_BUFFER {
+                data: json.as_mut_ptr(),
+                length: json.len(),
+            }));
+            _yrx_set_last_error::<SerializationError>(None);
+            YRX_RESULT::SUCCESS
+        }
+        Err(err) => {
+            _yrx_set_last_error(Some(err));
+            YRX_RESULT::SERIALIZATION_ERROR
+        }
+    }
+}
+
+/// Returns the warnings encountered during the compilation in JSON format.
+///
+/// In the address indicated by the `buf` pointer, the function will copy a
+/// `YRX_BUFFER*` pointer. The `YRX_BUFFER` structure represents a buffer
+/// that contains the JSON representation of the warnings.
+///
+/// The JSON consists on an array of objects, each object representing a
+/// warning. The object has the following fields:
+///
+/// * type: A string that describes the type of warning.
+/// * code: Warning code (e.g: "slow_pattern").
+/// * title: Error title (e.g: "slow pattern").
+/// * labels: Array of labels.
+/// * text: The full text of the warning report, as shown by the command-line tool.
+///
+/// Here is an example:
+///
+/// ```json
+/// [
+///     {
+///         "type": "SlowPattern",
+///         "code": "slow_pattern",
+///         "title": "slow pattern",
+///         "labels": [
+///             {
+///                 "level": "warning",
+///                 "code_origin": null,
+///                 "span": {"start":25,"end":28},
+///                 "text": "this pattern may slow down the scan"
+///             }
+///         ],
+///         "text": "... <full report here> ..."
+///     }
+/// ]
+/// ```
+///
+/// The [`YRX_BUFFER`] must be destroyed with [`yrx_buffer_destroy`].
+#[no_mangle]
+pub unsafe extern "C" fn yrx_compiler_warnings_json(
+    compiler: *mut YRX_COMPILER,
+    buf: &mut *mut YRX_BUFFER,
+) -> YRX_RESULT {
+    let compiler = if let Some(compiler) = compiler.as_mut() {
+        compiler
+    } else {
+        return YRX_RESULT::INVALID_ARGUMENT;
+    };
+
+    match serde_json::to_vec(compiler.inner.warnings()) {
+        Ok(json) => {
+            let json = json.into_boxed_slice();
+            let mut json = ManuallyDrop::new(json);
+            *buf = Box::into_raw(Box::new(YRX_BUFFER {
+                data: json.as_mut_ptr(),
+                length: json.len(),
+            }));
+            _yrx_set_last_error::<SerializationError>(None);
+            YRX_RESULT::SUCCESS
+        }
+        Err(err) => {
+            _yrx_set_last_error(Some(err));
+            YRX_RESULT::SERIALIZATION_ERROR
+        }
+    }
+}
+
 /// Builds the source code previously added to the compiler.
 ///
 /// After calling this function the compiler is reset to its initial state,
@@ -253,5 +552,5 @@ pub unsafe extern "C" fn yrx_compiler_build(
         _yrx_compiler_create(compiler.flags),
     );
 
-    Box::into_raw(Box::new(YRX_RULES(compiler.build())))
+    Box::into_raw(YRX_RULES::boxed(compiler.build()))
 }

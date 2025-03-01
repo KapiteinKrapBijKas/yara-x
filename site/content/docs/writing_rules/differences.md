@@ -158,25 +158,6 @@ In YARA-X you can specify different alphabets for `base64` and `base64wide`
 in the same pattern. In the example above, `base64` will use the default
 alphabet as always, while `base64wide` will use the custom alphabet.
 
-## Global rules can't depend on non-global rules
-
-In YARA 4.x a global rule can depend on a non-global rule, as long as the
-non-global rule is declared first. For instance, this is valid in YARA 4.x:
-
-```
-rule my_non_global_rule {
-  condition:
-    ....
-}
-
-global rule my_global_rule {
-  condition:
-    my_non_global_rule
-}
-```
-
-In YARA-X this is forbidden, global rules can only depend on other global rules.
-
 ## "of" statement accepts tuples of boolean expressions
 
 In YARA 4.x the `of` statement accepts a tuple of pattern or rule identifiers.
@@ -214,6 +195,38 @@ But this is not valid...
 ```
 1 of (some_rule*)
 ```
+
+## The "with" statement
+
+YARA-X now supports the `with` statement, which allows you to define identifiers
+that holds the result of a boolean expression. Each identifier is local and is valid
+only within the `with` statement. For example:
+
+```
+with 
+    a = 1 + 1, 
+    b = 2 : (
+        a == b
+  )
+```
+
+This is also useful to avoid repeating the same expression multiple times in the
+condition. For example:
+
+```
+with
+    a = foo.bar[0],
+    b = foo.bar[1] : (
+        a.name == b.name or
+        a.value == 0x10 or
+        b.value == 0x20 or
+        a.value == b.value
+  )
+```
+
+This is something that was not present in YARA 4.x and you had to repeat the
+expression multiple times.
+
 
 ## Using xor and fullword together
 

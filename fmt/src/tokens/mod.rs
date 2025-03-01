@@ -1,9 +1,8 @@
-use std::iter::Peekable;
-
 use lazy_static::lazy_static;
+use std::collections::VecDeque;
+use std::str::from_utf8_unchecked;
 
-use yara_x_parser::cst::CST;
-use yara_x_parser::GrammarRule;
+use yara_x_parser::cst::{Event, SyntaxKind};
 
 #[cfg(test)]
 mod tests;
@@ -23,129 +22,122 @@ mod tests;
 /// bits set to one, corresponding to the base categories contained in the
 /// super-category.
 pub(crate) mod categories {
-    use bitmask::bitmask;
+    use bitflags::bitflags;
     use lazy_static::lazy_static;
 
-    bitmask! {
-        #[derive(Debug)]
-        pub mask Category: u32 where flags BaseCategory  {
-            None                = 0b00000000000000000000000000000001,
-            Begin               = 0b00000000000000000000000000000010,
-            End                 = 0b00000000000000000000000000000100,
-            BlockBegin          = 0b00000000000000000000000000001000,
-            BlockEnd            = 0b00000000000000000000000000010000,
-            AlignmentBlockBegin = 0b00000000000000000000000000100000,
-            AlignmentBlockEnd   = 0b00000000000000000000000001000000,
-            AlignmentMarker     = 0b00000000000000000000000010000000,
-            Indentation         = 0b00000000000000000000000100000000,
-            Whitespace          = 0b00000000000000000000001000000000,
-            Comment             = 0b00000000000000000000010000000000,
-            Newline             = 0b00000000000000000000100000000000,
-            Punctuation         = 0b00000000000000000001000000000000,
-            Identifier          = 0b00000000000000000010000000000000,
-            Operator            = 0b00000000000000000100000000000000,
-            Keyword             = 0b00000000000000001000000000000000,
-            Literal             = 0b00000000000000010000000000000000,
-            LGrouping           = 0b00000000000000100000000000000000,
-            RGrouping           = 0b00000000000001000000000000000000,
+    bitflags! {
+        #[derive(Debug, Clone, Copy)]
+        pub struct Category: u32 {
+            const None                = 0b00000000000000000000000000000001;
+            const Begin               = 0b00000000000000000000000000000010;
+            const End                 = 0b00000000000000000000000000000100;
+            const BlockBegin          = 0b00000000000000000000000000001000;
+            const BlockEnd            = 0b00000000000000000000000000010000;
+            const AlignmentBlockBegin = 0b00000000000000000000000000100000;
+            const AlignmentBlockEnd   = 0b00000000000000000000000001000000;
+            const AlignmentMarker     = 0b00000000000000000000000010000000;
+            const Indentation         = 0b00000000000000000000000100000000;
+            const Whitespace          = 0b00000000000000000000001000000000;
+            const Comment             = 0b00000000000000000000010000000000;
+            const Newline             = 0b00000000000000000000100000000000;
+            const Punctuation         = 0b00000000000000000001000000000000;
+            const Identifier          = 0b00000000000000000010000000000000;
+            const Keyword             = 0b00000000000000000100000000000000;
+            const Literal             = 0b00000000000000001000000000000000;
+            const LGrouping           = 0b00000000000000010000000000000000;
+            const RGrouping           = 0b00000000000000100000000000000000;
         }
     }
     lazy_static! {
         // These are the base categories (i.e: those that don't contain another category)
         pub static ref NONE: Category =
-            Category::from(BaseCategory::None);
-
-        pub static ref BEGIN: Category =
-            Category::from(BaseCategory::Begin);
+            Category::None;
 
         pub static ref END: Category =
-            Category::from(BaseCategory::End);
+            Category::End;
 
         pub static ref BLOCK_BEGIN: Category =
-            Category::from(BaseCategory::BlockBegin);
+            Category::BlockBegin;
 
         pub static ref BLOCK_END: Category =
-            Category::from(BaseCategory::BlockEnd);
+            Category::BlockEnd;
 
         pub static ref ALIGNMENT_BLOCK_BEGIN: Category =
-            Category::from(BaseCategory::AlignmentBlockBegin);
+            Category::AlignmentBlockBegin;
 
         pub static ref ALIGNMENT_BLOCK_END: Category =
-            Category::from(BaseCategory::AlignmentBlockBegin);
+            Category::AlignmentBlockBegin;
 
         pub static ref ALIGNMENT_MARKER: Category =
-            Category::from(BaseCategory::AlignmentMarker);
+            Category::AlignmentMarker;
 
         pub static ref INDENTATION: Category =
-            Category::from(BaseCategory::Indentation);
+            Category::Indentation;
 
         pub static ref WHITESPACE: Category =
-            Category::from(BaseCategory::Whitespace);
+            Category::Whitespace;
 
         pub static ref COMMENT: Category =
-            Category::from(BaseCategory::Comment);
+            Category::Comment;
 
         pub static ref NEWLINE: Category =
-            Category::from(BaseCategory::Newline);
+            Category::Newline;
 
         pub static ref KEYWORD: Category =
-            Category::from(BaseCategory::Keyword);
+            Category::Keyword;
 
         pub static ref PUNCTUATION: Category =
-            Category::from(BaseCategory::Punctuation);
+            Category::Punctuation;
 
         pub static ref IDENTIFIER: Category =
-            Category::from(BaseCategory::Identifier);
-
-        pub static ref OPERATOR: Category =
-            Category::from(BaseCategory::Operator);
+            Category::Identifier;
 
         pub static ref LITERAL: Category =
-            Category::from(BaseCategory::Literal);
+            Category::Literal;
 
         pub static ref LGROUPING: Category =
-            Category::from(BaseCategory::LGrouping);
+            Category::LGrouping;
 
         pub static ref RGROUPING: Category =
-            Category::from(BaseCategory::RGrouping);
+            Category::RGrouping;
 
         // These are super-categories that are composed of other categories.
         pub static ref CONTROL: Category =
-            *BEGIN |
-            *END |
-            *INDENTATION |
-            *BLOCK_BEGIN |
-            *BLOCK_END |
-            *ALIGNMENT_BLOCK_BEGIN |
-            *ALIGNMENT_BLOCK_END;
+            Category::Begin |
+            Category::End |
+            Category::Indentation |
+            Category::BlockBegin |
+            Category::BlockEnd |
+            Category::AlignmentBlockBegin |
+            Category::AlignmentBlockEnd;
 
         pub static ref SPACING: Category =
-            *WHITESPACE |
-            *NEWLINE;
+            Category::Whitespace |
+            Category::Newline;
 
         pub static ref TEXT: Category =
-            *KEYWORD |
-            *PUNCTUATION |
-            *LGROUPING |
-            *RGROUPING |
-            *IDENTIFIER |
-            *OPERATOR |
-            *LITERAL;
+            Category::Keyword |
+            Category::Punctuation |
+            Category::LGrouping |
+            Category::RGrouping |
+            Category::Identifier |
+            Category::Literal;
     }
 }
 
 lazy_static! {
-    pub(crate) static ref COLON: Token<'static> = Token::Punctuation(":");
-    pub(crate) static ref DOT: Token<'static> = Token::Punctuation(".");
-    pub(crate) static ref DOT_DOT: Token<'static> = Token::Punctuation("..");
-    pub(crate) static ref EQUAL: Token<'static> = Token::Punctuation("=");
-    pub(crate) static ref HYPHEN: Token<'static> = Token::Punctuation("-");
-    pub(crate) static ref LBRACE: Token<'static> = Token::Punctuation("{");
-    pub(crate) static ref RBRACE: Token<'static> = Token::Punctuation("}");
-    pub(crate) static ref LBRACKET: Token<'static> = Token::LGrouping("[");
-    pub(crate) static ref RBRACKET: Token<'static> = Token::RGrouping("]");
-    pub(crate) static ref LPAREN: Token<'static> = Token::LGrouping("(");
-    pub(crate) static ref RPAREN: Token<'static> = Token::RGrouping(")");
+    pub(crate) static ref ASTERISK: Token<'static> = Token::Punctuation(b"*");
+    pub(crate) static ref COLON: Token<'static> = Token::Punctuation(b":");
+    pub(crate) static ref COMMA: Token<'static> = Token::Punctuation(b",");
+    pub(crate) static ref DOT: Token<'static> = Token::Punctuation(b".");
+    pub(crate) static ref EQUAL: Token<'static> = Token::Punctuation(b"=");
+    pub(crate) static ref HYPHEN: Token<'static> = Token::Punctuation(b"-");
+    pub(crate) static ref LBRACE: Token<'static> = Token::Punctuation(b"{");
+    pub(crate) static ref RBRACE: Token<'static> = Token::Punctuation(b"}");
+    pub(crate) static ref LBRACKET: Token<'static> = Token::LGrouping(b"[");
+    pub(crate) static ref RBRACKET: Token<'static> = Token::RGrouping(b"]");
+    pub(crate) static ref LPAREN: Token<'static> = Token::LGrouping(b"(");
+    pub(crate) static ref RPAREN: Token<'static> = Token::RGrouping(b")");
 }
 
 /// Type that represents the tokens used by the formatter.
@@ -165,10 +157,10 @@ pub(crate) enum Token<'a> {
     //
 
     // Indicates the point where a grammar rule starts.
-    Begin(GrammarRule),
+    Begin(SyntaxKind),
 
     // Indicates the point where a grammar rule ends.
-    End(GrammarRule),
+    End(SyntaxKind),
 
     // Increases or decreases the indentation level. The argument indicates
     // the number of levels (not spaces), a negative number decreases the
@@ -218,57 +210,58 @@ pub(crate) enum Token<'a> {
     // Non-control tokens
     //
     Whitespace,
-    Comment(&'a str),
+    #[allow(dead_code)]
+    Tab,
+    Comment(&'a [u8]),
 
-    BlockComment(Vec<String>),
-    HeadComment(Vec<String>),
-    TailComment(Vec<String>),
-    InlineComment(Vec<String>),
+    BlockComment(Vec<Vec<u8>>),
+    HeadComment(Vec<Vec<u8>>),
+    TailComment(Vec<Vec<u8>>),
+    InlineComment(Vec<Vec<u8>>),
 
     Newline,
-    Identifier(&'a str),
-    Keyword(&'a str),
-    Punctuation(&'a str),
-    Literal(&'a str),
+    Identifier(&'a [u8]),
+    Keyword(&'a [u8]),
+    Punctuation(&'a [u8]),
+    Literal(&'a [u8]),
 
     // Left parenthesis and brackets.
-    LGrouping(&'a str),
+    LGrouping(&'a [u8]),
     // Right parenthesis and brackets.
-    RGrouping(&'a str),
+    RGrouping(&'a [u8]),
 }
 
 impl<'a> Token<'a> {
     /// Returns the category the token belongs to.
-    pub fn category(&'a self) -> categories::BaseCategory {
+    pub fn category(&'a self) -> categories::Category {
         match self {
-            Token::None => categories::BaseCategory::None,
-            Token::Begin(..) => categories::BaseCategory::Begin,
-            Token::End(..) => categories::BaseCategory::End,
-            Token::BlockBegin => categories::BaseCategory::BlockBegin,
-            Token::BlockEnd => categories::BaseCategory::BlockEnd,
+            Token::None => categories::Category::None,
+            Token::Begin(..) => categories::Category::Begin,
+            Token::End(..) => categories::Category::End,
+            Token::BlockBegin => categories::Category::BlockBegin,
+            Token::BlockEnd => categories::Category::BlockEnd,
             Token::AlignmentBlockBegin => {
-                categories::BaseCategory::AlignmentBlockBegin
+                categories::Category::AlignmentBlockBegin
             }
             Token::AlignmentBlockEnd => {
-                categories::BaseCategory::AlignmentBlockEnd
+                categories::Category::AlignmentBlockEnd
             }
-            Token::AlignmentMarker => {
-                categories::BaseCategory::AlignmentMarker
-            }
-            Token::Indentation(..) => categories::BaseCategory::Indentation,
-            Token::Whitespace => categories::BaseCategory::Whitespace,
+            Token::AlignmentMarker => categories::Category::AlignmentMarker,
+            Token::Indentation(..) => categories::Category::Indentation,
+            Token::Whitespace => categories::Category::Whitespace,
+            Token::Tab => categories::Category::Whitespace,
             Token::Comment(..)
             | Token::BlockComment(..)
             | Token::TailComment(..)
             | Token::HeadComment(..)
-            | Token::InlineComment(..) => categories::BaseCategory::Comment,
-            Token::Newline => categories::BaseCategory::Newline,
-            Token::Identifier(..) => categories::BaseCategory::Identifier,
-            Token::Keyword(..) => categories::BaseCategory::Keyword,
-            Token::LGrouping(..) => categories::BaseCategory::LGrouping,
-            Token::RGrouping(..) => categories::BaseCategory::RGrouping,
-            Token::Punctuation(..) => categories::BaseCategory::Punctuation,
-            Token::Literal(..) => categories::BaseCategory::Literal,
+            | Token::InlineComment(..) => categories::Category::Comment,
+            Token::Newline => categories::Category::Newline,
+            Token::Identifier(..) => categories::Category::Identifier,
+            Token::Keyword(..) => categories::Category::Keyword,
+            Token::LGrouping(..) => categories::Category::LGrouping,
+            Token::RGrouping(..) => categories::Category::RGrouping,
+            Token::Punctuation(..) => categories::Category::Punctuation,
+            Token::Literal(..) => categories::Category::Literal,
         }
     }
 
@@ -291,12 +284,14 @@ impl<'a> Token<'a> {
         !self.eq(token)
     }
 
-    /// Returns the token as a string slice. Some control tokens return an
-    /// empty string,
-    pub fn as_str(&self) -> &'a str {
+    /// Returns the token as a byte slice.
+    ///
+    /// Some control tokens return an empty slice.
+    pub fn as_bytes(&self) -> &'a [u8] {
         match self {
-            Token::Whitespace => " ",
-            Token::Newline => "\n",
+            Token::Whitespace => b" ",
+            Token::Tab => b"\t",
+            Token::Newline => b"\n",
             Token::Identifier(s)
             | Token::Keyword(s)
             | Token::Punctuation(s)
@@ -317,7 +312,7 @@ impl<'a> Token<'a> {
             | Token::BlockComment(_)
             | Token::HeadComment(_)
             | Token::TailComment(_)
-            | Token::InlineComment(_) => "",
+            | Token::InlineComment(_) => b"",
         }
     }
 
@@ -325,90 +320,84 @@ impl<'a> Token<'a> {
     ///
     /// The length of control tokens is zero.
     pub fn len(&self) -> usize {
-        self.as_str().len()
+        self.as_bytes().len()
     }
 
     /// Create a token from a parser rule and its associated span.
-    fn from_rule(rule: GrammarRule, src: &'a str) -> Token<'a> {
-        match rule {
-            // Comment.
-            GrammarRule::COMMENT => Token::Comment(src),
-            // Whitespace.
-            GrammarRule::WHITESPACE => match src {
-                // The CST treats newlines as a type of whitespace, but the
-                // formatter has different type of tokens for newlines and
-                // whitespaces.
-                "\r" | "\n" | "\r\n" => Token::Newline,
-                " " | "\t" => Token::Whitespace,
-                _ => unreachable!(),
-            },
+    fn new(kind: SyntaxKind, src: &'a [u8]) -> Token<'a> {
+        match kind {
+            // Trivia.
+            SyntaxKind::COMMENT => Token::Comment(src),
+            SyntaxKind::NEWLINE => Token::Newline,
             // Keywords.
-            GrammarRule::k_ALL
-            | GrammarRule::k_AND
-            | GrammarRule::k_ANY
-            | GrammarRule::k_ASCII
-            | GrammarRule::k_AT
-            | GrammarRule::k_BASE64
-            | GrammarRule::k_BASE64WIDE
-            | GrammarRule::k_CONDITION
-            | GrammarRule::k_CONTAINS
-            | GrammarRule::k_DEFINED
-            | GrammarRule::k_ENDSWITH
-            | GrammarRule::k_ENTRYPOINT
-            | GrammarRule::k_FALSE
-            | GrammarRule::k_FILESIZE
-            | GrammarRule::k_FOR
-            | GrammarRule::k_FULLWORD
-            | GrammarRule::k_GLOBAL
-            | GrammarRule::k_ICONTAINS
-            | GrammarRule::k_IENDSWITH
-            | GrammarRule::k_IEQUALS
-            | GrammarRule::k_IMPORT
-            | GrammarRule::k_IN
-            | GrammarRule::k_ISTARTSWITH
-            | GrammarRule::k_MATCHES
-            | GrammarRule::k_META
-            | GrammarRule::k_NOCASE
-            | GrammarRule::k_NONE
-            | GrammarRule::k_NOT
-            | GrammarRule::k_OF
-            | GrammarRule::k_OR
-            | GrammarRule::k_PRIVATE
-            | GrammarRule::k_RULE
-            | GrammarRule::k_STARTSWITH
-            | GrammarRule::k_STRINGS
-            | GrammarRule::k_THEM
-            | GrammarRule::k_TRUE
-            | GrammarRule::k_WIDE
-            | GrammarRule::k_XOR => Token::Keyword(src),
+            SyntaxKind::ALL_KW
+            | SyntaxKind::AND_KW
+            | SyntaxKind::ANY_KW
+            | SyntaxKind::ASCII_KW
+            | SyntaxKind::AT_KW
+            | SyntaxKind::BASE64_KW
+            | SyntaxKind::BASE64WIDE_KW
+            | SyntaxKind::CONDITION_KW
+            | SyntaxKind::CONTAINS_KW
+            | SyntaxKind::DEFINED_KW
+            | SyntaxKind::ENDSWITH_KW
+            | SyntaxKind::ENTRYPOINT_KW
+            | SyntaxKind::FALSE_KW
+            | SyntaxKind::FILESIZE_KW
+            | SyntaxKind::FOR_KW
+            | SyntaxKind::FULLWORD_KW
+            | SyntaxKind::GLOBAL_KW
+            | SyntaxKind::ICONTAINS_KW
+            | SyntaxKind::IENDSWITH_KW
+            | SyntaxKind::IEQUALS_KW
+            | SyntaxKind::IMPORT_KW
+            | SyntaxKind::IN_KW
+            | SyntaxKind::ISTARTSWITH_KW
+            | SyntaxKind::MATCHES_KW
+            | SyntaxKind::META_KW
+            | SyntaxKind::NOCASE_KW
+            | SyntaxKind::NONE_KW
+            | SyntaxKind::NOT_KW
+            | SyntaxKind::OF_KW
+            | SyntaxKind::OR_KW
+            | SyntaxKind::PRIVATE_KW
+            | SyntaxKind::RULE_KW
+            | SyntaxKind::STARTSWITH_KW
+            | SyntaxKind::STRINGS_KW
+            | SyntaxKind::THEM_KW
+            | SyntaxKind::TRUE_KW
+            | SyntaxKind::WIDE_KW
+            | SyntaxKind::WITH_KW
+            | SyntaxKind::XOR_KW => Token::Keyword(src),
             // Punctuation.
-            GrammarRule::ASTERISK
-            | GrammarRule::COLON
-            | GrammarRule::COMMA
-            | GrammarRule::DOT
-            | GrammarRule::DOT_DOT
-            | GrammarRule::EQUAL
-            | GrammarRule::DOUBLE_QUOTES
-            | GrammarRule::LBRACE
-            | GrammarRule::RBRACE
-            | GrammarRule::MINUS
-            | GrammarRule::HYPHEN
-            | GrammarRule::PERCENT
-            | GrammarRule::PIPE
-            | GrammarRule::TILDE => Token::Punctuation(src),
+            SyntaxKind::ASTERISK
+            | SyntaxKind::COLON
+            | SyntaxKind::COMMA
+            | SyntaxKind::DOT
+            | SyntaxKind::EQUAL
+            | SyntaxKind::L_BRACE
+            | SyntaxKind::R_BRACE
+            | SyntaxKind::MINUS
+            | SyntaxKind::HYPHEN
+            | SyntaxKind::PERCENT
+            | SyntaxKind::PIPE
+            | SyntaxKind::TILDE => Token::Punctuation(src),
             // Grouping
-            GrammarRule::LBRACKET | GrammarRule::LPAREN => {
+            SyntaxKind::L_BRACKET | SyntaxKind::L_PAREN => {
                 Token::LGrouping(src)
             }
-            GrammarRule::RBRACKET | GrammarRule::RPAREN => {
+            SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
                 Token::RGrouping(src)
             }
             // Identifiers.
-            GrammarRule::ident
-            | GrammarRule::pattern_ident
-            | GrammarRule::pattern_count
-            | GrammarRule::pattern_offset
-            | GrammarRule::pattern_length => Token::Identifier(src),
+            SyntaxKind::IDENT
+            | SyntaxKind::PATTERN_IDENT
+            | SyntaxKind::PATTERN_COUNT
+            | SyntaxKind::PATTERN_OFFSET
+            | SyntaxKind::PATTERN_LENGTH => Token::Identifier(src),
+
+            // Whitespaces have a special treatment see Tokens::next.
+            SyntaxKind::WHITESPACE => unreachable!(),
             // Literals.
             _ => Token::Literal(src),
         }
@@ -428,10 +417,11 @@ pub(crate) trait TokenStream<'a>: Iterator<Item = Token<'a>> {
         for token in self {
             match token {
                 Token::Newline => {
-                    w.write_all("\n".as_bytes())?;
+                    w.write_all(b"\n")?;
                     col_num = 0;
                 }
                 Token::Whitespace
+                | Token::Tab
                 | Token::Comment(_)
                 | Token::Identifier(_)
                 | Token::Keyword(_)
@@ -439,7 +429,7 @@ pub(crate) trait TokenStream<'a>: Iterator<Item = Token<'a>> {
                 | Token::LGrouping(_)
                 | Token::RGrouping(_)
                 | Token::Punctuation(_) => {
-                    w.write_all(token.as_str().as_bytes())?;
+                    w.write_all(token.as_bytes())?;
                     col_num += token.len() as i16;
                 }
 
@@ -453,7 +443,7 @@ pub(crate) trait TokenStream<'a>: Iterator<Item = Token<'a>> {
                     // The first line of the comment is already indented.
                     if let Some(first_line) = lines.next() {
                         col_num += first_line.len() as i16;
-                        w.write_all(first_line.as_bytes())?;
+                        w.write_all(first_line)?;
                     }
 
                     // For all remaining lines in a multi-line comment we
@@ -464,7 +454,7 @@ pub(crate) trait TokenStream<'a>: Iterator<Item = Token<'a>> {
                         w.write_all(
                             " ".repeat(message_col as usize).as_bytes(),
                         )?;
-                        w.write_all(line.as_bytes())?;
+                        w.write_all(line)?;
                         col_num = message_col + line.len() as i16;
                     }
                 }
@@ -491,58 +481,62 @@ pub(crate) trait TokenStream<'a>: Iterator<Item = Token<'a>> {
 // implements the TokenStream trait.
 impl<'a, T> TokenStream<'a> for T where T: Iterator<Item = Token<'a>> {}
 
-/// An iterator that takes a parse tree generated by the parser and produces a
-/// sequence of tokens.
-pub(crate) struct Tokens<'a> {
-    // Each item in this stack contains a parser rule (i.e: rule_decl,
-    // boolean_expr, identifier, etc) and the parse tree corresponding to this
-    // rule.
-    stack: Vec<(Option<super::GrammarRule>, Peekable<CST<'a>>)>,
+/// An iterator that takes a sequence of events generated by the parser and
+/// produces a sequence of tokens which constitute the input to the formatter.
+pub(crate) struct Tokens<'src, E>
+where
+    E: Iterator<Item = Event>,
+{
+    source: &'src [u8],
+    events: E,
+    buffer: VecDeque<Token<'src>>,
 }
 
-impl<'a> Tokens<'a> {
-    pub fn new(parse_tree: CST<'a>) -> Self {
-        Self { stack: vec![(None, parse_tree.peekable())] }
+impl<'src, E> Tokens<'src, E>
+where
+    E: Iterator<Item = Event>,
+{
+    pub fn new(source: &'src [u8], events: E) -> Self {
+        Self { source, events, buffer: VecDeque::new() }
     }
 }
 
-impl<'a> Iterator for Tokens<'a> {
-    type Item = Token<'a>;
+impl<'src, E> Iterator for Tokens<'src, E>
+where
+    E: Iterator<Item = Event>,
+{
+    type Item = Token<'src>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.stack.is_empty() {
-            return None;
+        // Return a token from the buffer, if any.
+        if let Some(token) = self.buffer.pop_front() {
+            return Some(token);
         }
-        // Get the CST at the top of the stack, without removing it from the
-        // stack. It will be removed from the stack when all the rules in the
-        // parse tree are processed.
-        let (_, cst) = self.stack.last_mut().unwrap();
-
-        // Ignore the End-Of-Input (EOI) rule.
-        let mut cst = cst.filter(|i| i.as_rule() != GrammarRule::EOI);
-
-        // Get the next (rule, span) pair from the CST at the top of the stack.
-        if let Some(pair) = cst.next() {
-            let src = pair.as_str();
-            let rule = pair.as_rule();
-            let mut sub_tree = pair.into_inner().peekable();
-            // If the current rule contains inner rules we must process the
-            // inner rules first, so the current rule is put in the stack for
-            // later processing.
-            if sub_tree.peek().is_some() {
-                self.stack.push((Some(rule), sub_tree));
-                Some(Token::Begin(rule))
-            } else {
-                Some(Token::from_rule(rule, src))
+        loop {
+            match self.events.next()? {
+                Event::Begin(kind) => return Some(Token::Begin(kind)),
+                Event::End(kind) => return Some(Token::End(kind)),
+                Event::Token { kind, span } => {
+                    let token_bytes = &self.source[span.range()];
+                    // The whitespace token has a different treatment because
+                    // the parser returns a single whitespace token when
+                    // multiple whitespaces appear together. Here we separate
+                    // them into individual spaces.
+                    return if kind == SyntaxKind::WHITESPACE {
+                        // SAFETY: It's safe to assume that the whitespace
+                        // token is composed of valid UTF-8 characters. The
+                        // tokenizer guarantees this.
+                        let s = unsafe { from_utf8_unchecked(token_bytes) };
+                        for _ in s.chars() {
+                            self.buffer.push_back(Token::Whitespace);
+                        }
+                        self.buffer.pop_front()
+                    } else {
+                        Some(Token::new(kind, token_bytes))
+                    };
+                }
+                Event::Error { .. } => { /* ignore errors */ }
             }
-        } else {
-            // No more pairs in the parse tree at the top of the stack, remove
-            // it from the stack and return a token indicating the end of the
-            // rule.
-            let (rule, _) = self.stack.pop().unwrap();
-            // Return Some(Token::End(rule)) if rule is not None, or return
-            // None if otherwise.
-            rule.map(Token::End)
         }
     }
 }

@@ -22,16 +22,91 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
-use protobuf_json_mapping::print_to_string;
-use pyo3::create_exception;
+use protobuf_json_mapping::print_to_string as proto_to_json;
 use pyo3::exceptions::{PyException, PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString, PyTuple,
 };
+use pyo3::{create_exception, IntoPyObjectExt};
 use pyo3_file::PyFileLikeObject;
 
 use ::yara_x as yrx;
+
+/// Formats YARA rules.
+#[pyclass(unsendable)]
+struct Formatter {
+    inner: yara_x_fmt::Formatter,
+}
+
+#[pymethods]
+impl Formatter {
+    /// Creates a new [`Formatter`].
+    ///
+    /// `align_metadata` allows for aligning the equals signs in metadata definitions.
+    /// `align_patterns` allows for aligning the equals signs in pattern definitions.
+    /// `indent_section_headers` allows for indenting section headers.
+    /// `indent_section_contents` allows for indenting section contents.
+    /// `indent_spaces` is the number of spaces to use for indentation.
+    /// `newline_before_curly_brace` controls whether a newline is inserted before a curly brace.
+    /// `empty_line_before_section_header` controls whether an empty line is inserted before a section header.
+    /// `empty_line_after_section_header` controls whether an empty line is inserted after a section header.
+    #[new]
+    #[pyo3(signature = (
+        align_metadata = true,
+        align_patterns = true,
+        indent_section_headers = true,
+        indent_section_contents = true,
+        indent_spaces = 2,
+        newline_before_curly_brace = false,
+        empty_line_before_section_header = true,
+        empty_line_after_section_header = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        align_metadata: bool,
+        align_patterns: bool,
+        indent_section_headers: bool,
+        indent_section_contents: bool,
+        indent_spaces: u8,
+        newline_before_curly_brace: bool,
+        empty_line_before_section_header: bool,
+        empty_line_after_section_header: bool,
+    ) -> Self {
+        Self {
+            inner: yara_x_fmt::Formatter::new()
+                .align_metadata(align_metadata)
+                .align_patterns(align_patterns)
+                .indent_section_headers(indent_section_headers)
+                .indent_section_contents(indent_section_contents)
+                .indent_spaces(indent_spaces)
+                .newline_before_curly_brace(newline_before_curly_brace)
+                .empty_line_before_section_header(
+                    empty_line_before_section_header,
+                )
+                .empty_line_after_section_header(
+                    empty_line_after_section_header,
+                ),
+        }
+    }
+
+    /// Format a YARA rule
+    fn format(&self, input: PyObject, output: PyObject) -> PyResult<()> {
+        let in_buf = PyFileLikeObject::with_requirements(
+            input, true, false, false, false,
+        )?;
+
+        let mut out_buf = PyFileLikeObject::with_requirements(
+            output, false, true, false, false,
+        )?;
+
+        self.inner
+            .format(in_buf, &mut out_buf)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(())
+    }
+}
 
 /// Compiles a YARA source code producing a set of compiled [`Rules`].
 ///
@@ -50,14 +125,17 @@ fn compile(src: &str) -> PyResult<Rules> {
 struct Compiler {
     inner: yrx::Compiler<'static>,
     relaxed_re_syntax: bool,
+    error_on_slow_pattern: bool,
 }
 
 impl Compiler {
-    fn new_inner(relaxed_re_syntax: bool) -> yrx::Compiler<'static> {
+    fn new_inner(
+        relaxed_re_syntax: bool,
+        error_on_slow_pattern: bool,
+    ) -> yrx::Compiler<'static> {
         let mut compiler = yrx::Compiler::new();
-        if relaxed_re_syntax {
-            compiler.relaxed_re_syntax(true);
-        }
+        compiler.relaxed_re_syntax(relaxed_re_syntax);
+        compiler.error_on_slow_pattern(error_on_slow_pattern);
         compiler
     }
 }
@@ -77,19 +155,65 @@ impl Compiler {
     /// their meaning from the context (e.g., `{` and `}` in `/foo{}bar/` are
     /// literal, but in `/foo{0,1}bar/` they form the repetition operator
     /// `{0,1}`).
+    ///
+    /// The `error_on_slow_pattern` argument tells the compiler to treat slow
+    /// patterns as errors, instead of warnings.
     #[new]
-    #[pyo3(signature = (*, relaxed_re_syntax=false))]
-    fn new(relaxed_re_syntax: bool) -> Self {
-        Self { inner: Self::new_inner(relaxed_re_syntax), relaxed_re_syntax }
+    #[pyo3(signature = (*, relaxed_re_syntax=false, error_on_slow_pattern=false))]
+    fn new(relaxed_re_syntax: bool, error_on_slow_pattern: bool) -> Self {
+        Self {
+            inner: Self::new_inner(relaxed_re_syntax, error_on_slow_pattern),
+            relaxed_re_syntax,
+            error_on_slow_pattern,
+        }
+    }
+
+    /// Specify a regular expression that the compiler will enforce upon each
+    /// rule name. Any rule which has a name which does not match this regex
+    /// will return an InvalidRuleName warning.
+    ///
+    /// If the regexp does not compile a ValueError is returned.
+    #[pyo3(signature = (regexp_str))]
+    fn rule_name_regexp(&mut self, regexp_str: &str) -> PyResult<()> {
+        let linter = yrx::linters::rule_name(regexp_str)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.inner.add_linter(linter);
+        Ok(())
     }
 
     /// Adds a YARA source code to be compiled.
     ///
-    /// This function can be used multiple times before calling [`Compiler::build`].
-    fn add_source(&mut self, src: &str) -> PyResult<()> {
+    /// This function may be invoked multiple times to add several sets of YARA
+    /// rules before calling [`Compiler::build`]. If the rules provided in
+    /// `src` contain errors that prevent compilation, the function will raise
+    /// an exception with the first error encountered. Additionally, the
+    /// compiler will store this error, along with any others discovered during
+    /// compilation, which can be accessed using [`Compiler::errors`].
+    ///
+    /// Even if a previous invocation resulted in a compilation error, you can
+    /// continue calling this function. In such cases, any rules that failed to
+    /// compile will not be included in the final compiled set.
+    ///
+    /// The optional parameter `origin` allows to specify the origin of the
+    /// source code. This usually receives the path of the file from where the
+    /// code was read, but it can be any arbitrary string that conveys information
+    /// about the source code's origin.
+    #[pyo3(signature = (src, origin=None))]
+    fn add_source(
+        &mut self,
+        src: &str,
+        origin: Option<String>,
+    ) -> PyResult<()> {
+        let mut src = yrx::SourceCode::from(src);
+
+        if let Some(origin) = origin.as_ref() {
+            src = src.with_origin(origin)
+        }
+
         self.inner
             .add_source(src)
             .map_err(|err| CompileError::new_err(err.to_string()))?;
+
         Ok(())
     }
 
@@ -160,9 +284,42 @@ impl Compiler {
     fn build(&mut self) -> Rules {
         let compiler = mem::replace(
             &mut self.inner,
-            Self::new_inner(self.relaxed_re_syntax),
+            Self::new_inner(
+                self.relaxed_re_syntax,
+                self.error_on_slow_pattern,
+            ),
         );
         Rules::new(compiler.build())
+    }
+
+    /// Retrieves all errors generated by the compiler.
+    ///
+    /// This method returns every error encountered during the compilation,
+    /// across all invocations of [`Compiler::add_source`].
+    fn errors<'py>(&'py self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let json = PyModule::import(py, "json")?;
+        let json_loads = json.getattr("loads")?;
+        let errors_json = serde_json::to_string_pretty(&self.inner.errors());
+        let errors_json = errors_json
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        json_loads.call((errors_json,), None)
+    }
+
+    /// Retrieves all warnings generated by the compiler.
+    ///
+    /// This method returns every warning encountered during the compilation,
+    /// across all invocations of [`Compiler::add_source`].
+    fn warnings<'py>(
+        &'py self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let json = PyModule::import(py, "json")?;
+        let json_loads = json.getattr("loads")?;
+        let warnings_json =
+            serde_json::to_string_pretty(&self.inner.warnings());
+        let warnings_json = warnings_json
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        json_loads.call((warnings_json,), None)
     }
 }
 
@@ -311,7 +468,10 @@ impl ScanResults {
 
     #[getter]
     /// Rules that matched during the scan.
-    fn module_outputs<'py>(&'py self, py: Python<'py>) -> &Bound<'py, PyDict> {
+    fn module_outputs<'py>(
+        &'py self,
+        py: Python<'py>,
+    ) -> &'py Bound<'py, PyDict> {
         self.module_outputs.bind(py)
     }
 }
@@ -321,6 +481,7 @@ impl ScanResults {
 struct Rule {
     identifier: String,
     namespace: String,
+    tags: Py<PyTuple>,
     metadata: Py<PyTuple>,
     patterns: Py<PyTuple>,
 }
@@ -337,6 +498,12 @@ impl Rule {
     #[getter]
     fn namespace(&self) -> &str {
         self.namespace.as_str()
+    }
+
+    /// Returns the rule's tags.
+    #[getter]
+    fn tags(&self) -> Py<PyTuple> {
+        Python::with_gil(|py| self.tags.clone_ref(py))
     }
 
     /// A tuple of pairs `(identifier, value)` with the metadata associated to
@@ -467,10 +634,6 @@ impl Rules {
 
         Python::with_gil(|py| Py::new(py, Rules::new(rules)))
     }
-
-    fn warnings(&self) -> Vec<String> {
-        self.inner.rules.warnings().iter().map(|w| w.to_string()).collect()
-    }
 }
 
 fn scan_results_to_py(
@@ -482,20 +645,26 @@ fn scan_results_to_py(
         .map(|rule| rule_to_py(py, rule))
         .collect::<PyResult<Vec<_>>>()?;
 
-    let json = PyModule::import_bound(py, "json")?;
-    let json_loads = json.getattr("loads")?;
+    let module_outputs = PyDict::new(py);
+    let outputs = scan_results.module_outputs();
 
-    let module_outputs = PyDict::new_bound(py);
-    for (module, output) in scan_results.module_outputs() {
-        let module_output_json = print_to_string(output).unwrap();
-        let module_output = json_loads.call((module_output_json,), None)?;
-        module_outputs.set_item(module, module_output)?;
+    // For better performance we only load the "json" module if there's
+    // some module output.
+    if outputs.len() > 0 {
+        let json = PyModule::import(py, "json")?;
+        let json_loads = json.getattr("loads")?;
+        for (module, output) in outputs {
+            let module_output_json = proto_to_json(output).unwrap();
+            let module_output =
+                json_loads.call((module_output_json,), None)?;
+            module_outputs.set_item(module, module_output)?;
+        }
     }
 
     Py::new(
         py,
         ScanResults {
-            matching_rules: PyTuple::new_bound(py, matching_rules).unbind(),
+            matching_rules: PyTuple::new(py, matching_rules)?.unbind(),
             module_outputs: module_outputs.into(),
         },
     )
@@ -507,18 +676,20 @@ fn rule_to_py(py: Python, rule: yrx::Rule) -> PyResult<Py<Rule>> {
         Rule {
             identifier: rule.identifier().to_string(),
             namespace: rule.namespace().to_string(),
-            metadata: PyTuple::new_bound(
+            tags: PyTuple::new(py, rule.tags().map(|tag| tag.identifier()))?
+                .unbind(),
+            metadata: PyTuple::new(
                 py,
                 rule.metadata()
                     .map(|(ident, value)| metadata_to_py(py, ident, value)),
-            )
+            )?
             .unbind(),
-            patterns: PyTuple::new_bound(
+            patterns: PyTuple::new(
                 py,
                 rule.patterns()
                     .map(|pattern| pattern_to_py(py, pattern))
                     .collect::<Result<Vec<_>, _>>()?,
-            )
+            )?
             .unbind(),
         },
     )
@@ -530,14 +701,15 @@ fn metadata_to_py(
     metadata: yrx::MetaValue,
 ) -> Py<PyTuple> {
     let value = match metadata {
-        yrx::MetaValue::Integer(v) => v.to_object(py),
-        yrx::MetaValue::Float(v) => v.to_object(py),
-        yrx::MetaValue::Bool(v) => v.to_object(py),
-        yrx::MetaValue::String(v) => v.to_object(py),
-        yrx::MetaValue::Bytes(v) => v.to_object(py),
-    };
+        yrx::MetaValue::Integer(v) => v.into_py_any(py),
+        yrx::MetaValue::Float(v) => v.into_py_any(py),
+        yrx::MetaValue::Bool(v) => v.into_py_any(py),
+        yrx::MetaValue::String(v) => v.into_py_any(py),
+        yrx::MetaValue::Bytes(v) => v.into_py_any(py),
+    }
+    .unwrap();
 
-    PyTuple::new_bound(py, [ident.to_object(py), value]).unbind()
+    PyTuple::new(py, [ident.into_py_any(py).unwrap(), value]).unwrap().unbind()
 }
 
 fn pattern_to_py(py: Python, pattern: yrx::Pattern) -> PyResult<Py<Pattern>> {
@@ -545,13 +717,13 @@ fn pattern_to_py(py: Python, pattern: yrx::Pattern) -> PyResult<Py<Pattern>> {
         py,
         Pattern {
             identifier: pattern.identifier().to_string(),
-            matches: PyTuple::new_bound(
+            matches: PyTuple::new(
                 py,
                 pattern
                     .matches()
                     .map(|match_| match_to_py(py, match_))
                     .collect::<Result<Vec<_>, _>>()?,
-            )
+            )?
             .unbind(),
         },
     )
@@ -589,9 +761,9 @@ create_exception!(
     "Exception raised when scanning fails"
 );
 
-fn map_scan_err(err: yrx::ScanError) -> PyErr {
+fn map_scan_err(err: yrx::errors::ScanError) -> PyErr {
     match err {
-        yrx::ScanError::Timeout => TimeoutError::new_err("timeout"),
+        yrx::errors::ScanError::Timeout => TimeoutError::new_err("timeout"),
         err => ScanError::new_err(err.to_string()),
     }
 }
@@ -606,9 +778,9 @@ fn map_scan_err(err: yrx::ScanError) -> PyErr {
 /// ```
 #[pymodule]
 fn yara_x(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("CompileError", m.py().get_type_bound::<CompileError>())?;
-    m.add("TimeoutError", m.py().get_type_bound::<TimeoutError>())?;
-    m.add("ScanError", m.py().get_type_bound::<ScanError>())?;
+    m.add("CompileError", m.py().get_type::<CompileError>())?;
+    m.add("TimeoutError", m.py().get_type::<TimeoutError>())?;
+    m.add("ScanError", m.py().get_type::<ScanError>())?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_class::<Rules>()?;
     m.add_class::<Scanner>()?;
@@ -616,5 +788,6 @@ fn yara_x(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Rule>()?;
     m.add_class::<Pattern>()?;
     m.add_class::<Match>()?;
+    m.add_class::<Formatter>()?;
     Ok(())
 }

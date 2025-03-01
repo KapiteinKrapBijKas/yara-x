@@ -10,27 +10,27 @@ mod scan;
 pub use check::*;
 pub use compile::*;
 pub use completion::*;
+#[cfg(feature = "debug-cmd")]
 pub use debug::*;
 pub use dump::*;
 pub use fix::*;
 pub use fmt::*;
 pub use scan::*;
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
-use clap::{command, crate_authors, Command};
+use anyhow::{anyhow, bail, Context};
+use clap::{arg, command, crate_authors, ArgMatches, Command};
 use crossterm::tty::IsTty;
-use serde_json::Value;
 use superconsole::{Component, Line, Lines, Span, SuperConsole};
 use yansi::Color::Green;
 use yansi::Paint;
 
-use crate::{commands, APP_HELP_TEMPLATE};
-use yara_x::{Compiler, Rules};
-use yara_x_parser::SourceCode;
+use crate::{commands, help, APP_HELP_TEMPLATE};
+use yara_x::{Compiler, Rules, SourceCode};
 
 use crate::walk::Walker;
 
@@ -38,7 +38,7 @@ pub fn command(name: &'static str) -> Command {
     Command::new(name).help_template(
         r#"{about-with-newline}
 {usage-heading}
-    {usage}
+  {usage}
 
 {all-args}
 "#,
@@ -49,11 +49,18 @@ pub fn cli() -> Command {
     command!()
         .author(crate_authors!("\n")) // requires `cargo` feature
         .arg_required_else_help(true)
+        .arg(
+            arg!(-C --config <CONFIG_FILE> "Config file")
+                .value_parser(existing_path_parser)
+                .long_help(help::CONFIG_FILE),
+        )
         .help_template(APP_HELP_TEMPLATE)
+        .subcommand_required(true)
         .subcommands(vec![
             commands::scan(),
             commands::compile(),
             commands::check(),
+            #[cfg(feature = "debug-cmd")]
             commands::debug(),
             commands::dump(),
             commands::fmt(),
@@ -62,6 +69,19 @@ pub fn cli() -> Command {
         ])
 }
 
+/// Get the external variables defined in the command-line arguments via the
+/// `--define` option.
+fn get_external_vars(
+    args: &ArgMatches,
+) -> Option<Vec<(String, serde_json::Value)>> {
+    args.get_many::<(String, serde_json::Value)>("define")
+        .map(|var| var.cloned().collect())
+}
+
+/// Parses the arguments to the `--define` option, which have the form
+/// `VAR=VALUE`.
+///
+/// Returns the variable name and the value as a [`serde_json::Value`].
 fn external_var_parser(
     option: &str,
 ) -> Result<(String, serde_json::Value), anyhow::Error> {
@@ -81,20 +101,95 @@ fn external_var_parser(
     Ok((var.to_string(), value))
 }
 
-pub fn compile_rules<'a, P>(
-    paths: P,
-    path_as_namespace: bool,
-    external_vars: Option<Vec<(String, Value)>>,
-    relaxed_re_syntax: bool,
-) -> Result<Rules, anyhow::Error>
-where
-    P: Iterator<Item = &'a PathBuf>,
-{
+/// Parses the argument to the `--module-data` option, which have the form
+/// `MODULE=FILE`.
+fn meta_file_value_parser(
+    option: &str,
+) -> Result<(String, PathBuf), anyhow::Error> {
+    let (var, value) = option.split_once('=').ok_or(anyhow!(
+        "the equal sign is missing, use the syntax MODULE=FILE (example: {}=file)",
+        option
+    ))?;
+
+    let value = PathBuf::from(value);
+    Ok((var.to_string(), value))
+}
+
+/// Parses a path prefixed by an optional namespace. Like this:
+/// `[NAMESPACE:]PATH`.
+///
+/// Returns the namespace and the path. If the namespace is not provided
+/// returns [`None`].
+///
+/// In Windows, namespaces with a single character are not allowed as they can
+/// be confused with a drive letter.
+fn path_with_namespace_parser(
+    input: &str,
+) -> Result<(Option<String>, PathBuf), anyhow::Error> {
+    if let Some((namespace, path)) = input.split_once(':') {
+        // In Windows a namespace with a single letter could actually be a
+        // drive letter.
+        #[cfg(target_os = "windows")]
+        if namespace.len() == 1 {
+            return Ok((None, PathBuf::from(input)));
+        }
+        Ok((Some(namespace.to_string()), PathBuf::from(path)))
+    } else {
+        Ok((None, PathBuf::from(input)))
+    }
+}
+
+/// Parses a path and makes sure that it exists.
+fn existing_path_parser(input: &str) -> Result<PathBuf, anyhow::Error> {
+    let path = PathBuf::from(input);
+    if path.try_exists()? {
+        Ok(path)
+    } else {
+        Err(anyhow!("file not found"))
+    }
+}
+
+pub fn create_compiler(
+    external_vars: Option<Vec<(String, serde_json::Value)>>,
+    args: &ArgMatches,
+) -> Result<Compiler, anyhow::Error> {
     let mut compiler: Compiler<'_> = Compiler::new();
 
     compiler
-        .relaxed_re_syntax(relaxed_re_syntax)
+        .relaxed_re_syntax(
+            args.try_get_one::<bool>("relaxed-re-syntax")
+                .unwrap_or_default()
+                .cloned()
+                .unwrap_or_default(),
+        )
         .colorize_errors(stdout().is_tty());
+
+    for m in args
+        .try_get_many::<String>("ignore-module")
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+    {
+        compiler.ignore_module(m);
+    }
+
+    let disabled_warnings: Vec<_> = args
+        .try_get_many::<String>("disable-warnings")
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // If the `disabled_warnings` vector contains "all", all warnings will
+    // be disabled. Otherwise, only the warnings with codes listed in
+    // `disabled_warnings` will be disabled.
+    if disabled_warnings.iter().any(|w| *w == "all") {
+        compiler.switch_all_warnings(false);
+    } else {
+        for warning in &disabled_warnings {
+            compiler.switch_warning(warning, false)?;
+        }
+    }
 
     if let Some(vars) = external_vars {
         for (ident, value) in vars {
@@ -102,16 +197,36 @@ where
         }
     }
 
+    Ok(compiler)
+}
+
+pub fn compile_rules<'a, P>(
+    paths: P,
+    external_vars: Option<Vec<(String, serde_json::Value)>>,
+    args: &ArgMatches,
+) -> Result<Rules, anyhow::Error>
+where
+    P: Iterator<Item = &'a (Option<String>, PathBuf)>,
+{
+    let mut compiler = create_compiler(external_vars, args)?;
+
     let mut console =
         if stdout().is_tty() { SuperConsole::new() } else { None };
 
     let mut state = CompileState::new();
 
-    for path in paths {
+    for (namespace, path) in paths {
         let mut w = Walker::path(path);
 
         w.filter("**/*.yar");
         w.filter("**/*.yara");
+
+        compiler.new_namespace(
+            namespace
+                .as_ref()
+                .map(|namespace| namespace.as_str())
+                .unwrap_or("default"),
+        );
 
         if let Err(err) = w.walk(
             |file_path| {
@@ -128,16 +243,14 @@ where
                 let src = SourceCode::from(src.as_slice())
                     .with_origin(file_path.as_os_str().to_str().unwrap());
 
-                if path_as_namespace {
+                if args.get_flag("path-as-namespace") {
                     compiler
                         .new_namespace(file_path.to_string_lossy().as_ref());
                 }
 
-                let result = compiler.add_source(src);
+                let _ = compiler.add_source(src);
 
                 state.file_in_progress = None;
-
-                result?;
 
                 state.num_compiled_files =
                     state.num_compiled_files.saturating_add(1);
@@ -148,21 +261,29 @@ where
             Err,
         ) {
             if let Some(console) = console {
-                console.finalize(&state).unwrap();
+                console.finalize(&state)?;
             }
             return Err(err);
         }
     }
 
-    let rules = compiler.build();
-
     if let Some(console) = console {
-        console.finalize(&state).unwrap();
+        console.finalize(&state)?;
     }
 
-    for warning in rules.warnings() {
+    for error in compiler.errors() {
+        eprintln!("{}", error);
+    }
+
+    for warning in compiler.warnings() {
         eprintln!("{}", warning);
     }
+
+    if !compiler.errors().is_empty() {
+        bail!("{} errors found", compiler.errors().len());
+    }
+
+    let rules = compiler.build();
 
     Ok(rules)
 }
@@ -200,10 +321,10 @@ impl Component for CompileState {
     }
 }
 
-fn truncate_with_ellipsis(s: String, max_length: usize) -> String {
+fn truncate_with_ellipsis(s: Cow<str>, max_length: usize) -> Cow<str> {
     if s.len() <= max_length {
         s
     } else {
-        format!("{}...", &s[..max_length - 3])
+        format!("{}...", &s[..max_length - 3]).into()
     }
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
+use std::slice::Iter;
 #[cfg(feature = "logging")]
 use std::time::Instant;
 
@@ -10,17 +11,18 @@ use log::*;
 use regex_automata::meta::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use yara_x_parser::ast::Span;
-use yara_x_parser::Warning;
-
 use crate::compiler::atoms::Atom;
+use crate::compiler::errors::SerializationError;
+use crate::compiler::report::CodeLoc;
+use crate::compiler::warnings::Warning;
 use crate::compiler::{
     IdentId, Imports, LiteralId, NamespaceId, PatternId, RegexpId, RuleId,
     SubPattern, SubPatternId,
 };
+use crate::models::PatternKind;
 use crate::re::{BckCodeLoc, FwdCodeLoc, RegexpAtom};
 use crate::string_pool::{BStringPool, StringPool};
-use crate::{re, types, SerializationError};
+use crate::{re, types, Rule};
 
 /// A set of YARA rules in compiled form.
 ///
@@ -47,12 +49,17 @@ pub struct Rules {
     /// string as `&BStr`.
     pub(in crate::compiler) lit_pool: BStringPool<LiteralId>,
 
+    /// WASM module as in raw form.
+    pub(in crate::compiler) wasm_mod: Vec<u8>,
+
     /// WASM module already compiled into native code for the current platform.
+    /// When the rules are serialized, the compiled module is included only if
+    /// the `native-code-serialization` is enabled.
     #[serde(
         serialize_with = "serialize_wasm_mod",
         deserialize_with = "deserialize_wasm_mod"
     )]
-    pub(in crate::compiler) wasm_mod: wasmtime::Module,
+    pub(in crate::compiler) compiled_wasm_mod: Option<wasmtime::Module>,
 
     /// Vector with the names of all the imported modules. The vector contains
     /// the [`IdentId`] corresponding to the module's identifier.
@@ -165,6 +172,31 @@ impl Rules {
         #[cfg(feature = "logging")]
         info!("Deserialization time: {:?}", Instant::elapsed(&start));
 
+        // `rules.compiled_wasm_mod` can be `None` for two reasons:
+        //
+        //  1- The rules were serialized without compiled rules (i.e: the
+        //     `native-code-serialization` feature was disabled, which is
+        //     the default).
+        //
+        //  2- The rules were serialized with compiled rules, but they were
+        //     compiled for a different platform, and `deserialize_wasm_mod`
+        //     returned `None`.
+        //
+        // In both cases we try to build the module again from the data in
+        // `rules.wasm_mode`.
+        if rules.compiled_wasm_mod.is_none() {
+            #[cfg(feature = "logging")]
+            let start = Instant::now();
+
+            rules.compiled_wasm_mod = Some(wasmtime::Module::from_binary(
+                &crate::wasm::ENGINE,
+                rules.wasm_mod.as_slice(),
+            )?);
+
+            #[cfg(feature = "logging")]
+            info!("WASM build time: {:?}", Instant::elapsed(&start));
+        }
+
         rules.build_ac_automaton();
 
         Ok(rules)
@@ -199,6 +231,29 @@ impl Rules {
         let mut bytes = Vec::new();
         let _ = reader.read_to_end(&mut bytes)?;
         Self::deserialize(bytes)
+    }
+
+    /// Returns an iterator that yields the compiled rules.
+    ///
+    /// ```rust
+    /// # use yara_x::Compiler;
+    /// let mut compiler = Compiler::new();
+    ///
+    /// assert!(compiler
+    ///     .add_source("rule foo {condition: true}")
+    ///     .unwrap()
+    ///     .add_source("rule bar {condition: true}")
+    ///     .is_ok());
+    ///
+    /// let rules = compiler.build();
+    /// let mut iter = rules.iter();
+    ///
+    /// assert_eq!(iter.len(), 2);
+    /// assert_eq!(iter.next().map(|r| r.identifier()), Some("foo"));
+    /// assert_eq!(iter.next().map(|r| r.identifier()), Some("bar"));
+    /// ```
+    pub fn iter(&self) -> RulesIter {
+        RulesIter { rules: self, iterator: self.rules.iter() }
     }
 
     /// Returns a [`RuleInfo`] given its [`RuleId`].
@@ -260,7 +315,7 @@ impl Rules {
     ) -> Option<(RuleId, IdentId)> {
         let (target_pattern_id, _) = self.get_sub_pattern(sub_pattern_id);
         for (rule_id, rule) in self.rules.iter().enumerate() {
-            for (ident_id, pattern_id) in &rule.patterns {
+            for (ident_id, _, pattern_id) in &rule.patterns {
                 if pattern_id == target_pattern_id {
                     return Some((rule_id.into(), *ident_id));
                 };
@@ -397,35 +452,81 @@ impl Rules {
 
     #[inline]
     pub(crate) fn wasm_mod(&self) -> &wasmtime::Module {
-        &self.wasm_mod
+        self.compiled_wasm_mod.as_ref().unwrap()
     }
 }
 
+#[cfg(feature = "native-code-serialization")]
 fn serialize_wasm_mod<S>(
-    wasm_mod: &wasmtime::Module,
+    wasm_mod: &Option<wasmtime::Module>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let bytes = wasm_mod
-        .serialize()
-        .map_err(|err| serde::ser::Error::custom(err.to_string()))?;
+    if let Some(wasm_mod) = wasm_mod {
+        let bytes = wasm_mod
+            .serialize()
+            .map_err(|err| serde::ser::Error::custom(err.to_string()))?;
 
-    serializer.serialize_bytes(bytes.as_slice())
+        serializer.serialize_some(bytes.as_slice())
+    } else {
+        serializer.serialize_none()
+    }
+}
+
+#[cfg(not(feature = "native-code-serialization"))]
+fn serialize_wasm_mod<S>(
+    _wasm_mod: &Option<wasmtime::Module>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_none()
 }
 
 pub fn deserialize_wasm_mod<'de, D>(
     deserializer: D,
-) -> Result<wasmtime::Module, D::Error>
+) -> Result<Option<wasmtime::Module>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let bytes: &[u8] = Deserialize::deserialize(deserializer)?;
+    let bytes: Option<&[u8]> = Deserialize::deserialize(deserializer)?;
+    let module = if let Some(bytes) = bytes {
+        unsafe {
+            wasmtime::Module::deserialize(&crate::wasm::ENGINE, bytes).ok()
+        }
+    } else {
+        None
+    };
 
-    unsafe {
-        wasmtime::Module::deserialize(&crate::wasm::ENGINE, bytes)
-            .map_err(|err| serde::de::Error::custom(err.to_string()))
+    Ok(module)
+}
+
+/// Iterator that yields the of the compiled rules.
+pub struct RulesIter<'a> {
+    rules: &'a Rules,
+    iterator: Iter<'a, RuleInfo>,
+}
+
+impl<'a> Iterator for RulesIter<'a> {
+    type Item = Rule<'a, 'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(Rule {
+            ctx: None,
+            data: None,
+            rules: self.rules,
+            rule_info: self.iterator.next()?,
+        })
+    }
+}
+
+impl ExactSizeIterator for RulesIter<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.iterator.len()
     }
 }
 
@@ -439,7 +540,7 @@ impl fmt::Debug for Rules {
             writeln!(f, "  namespace: {}", namespace)?;
             writeln!(f, "  name: {}", name)?;
             writeln!(f, "  patterns:")?;
-            for (pattern_ident_id, pattern_id) in &rule.patterns {
+            for (pattern_ident_id, _, pattern_id) in &rule.patterns {
                 let ident = self.ident_pool.get(*pattern_ident_id).unwrap();
                 writeln!(f, "    {:?} {} ", pattern_id, ident)?;
             }
@@ -472,15 +573,18 @@ pub(crate) struct RuleInfo {
     pub(crate) namespace_ident_id: IdentId,
     /// The ID of the rule identifier in the identifiers pool.
     pub(crate) ident_id: IdentId,
-    /// Span of the rule identifier. This field is ignored while serializing
-    /// and deserializing compiles rules, as it is used only during the
-    /// compilation phase, but not during the scan phase.
+    /// Tags associated to the rule.
+    pub(crate) tags: Vec<IdentId>,
+    /// Reference to the rule identifier in the source code. This field is
+    /// ignored while serializing and deserializing compiles rules, as it
+    /// is used only during the compilation phase, but not during the scan
+    /// phase.
     #[serde(skip)]
-    pub(crate) ident_span: Span,
+    pub(crate) ident_ref: CodeLoc,
     /// Metadata associated to the rule.
     pub(crate) metadata: Vec<(IdentId, MetaValue)>,
     /// Vector with all the patterns defined by this rule.
-    pub(crate) patterns: Vec<(IdentId, PatternId)>,
+    pub(crate) patterns: Vec<(IdentId, PatternKind, PatternId)>,
     /// True if the rule is global.
     pub(crate) is_global: bool,
     /// True if the rule is private.

@@ -1,5 +1,3 @@
-use pretty_assertions::assert_eq;
-
 use crate::modules::tests::create_binary_from_zipped_ihex;
 use crate::tests::rule_false;
 use crate::tests::rule_true;
@@ -18,6 +16,12 @@ fn test_macho_module() {
     let chess_macho_data = create_binary_from_zipped_ihex(
         "src/modules/macho/tests/testdata/chess.in.zip",
     );
+
+    let symbolt_table_test_data = create_binary_from_zipped_ihex(
+        "src/modules/macho/tests/testdata/8962a76d0aeaee3326cf840de11543c8beebeb768e712bd3b754b5cd3e151356.in.zip",
+    );
+
+    let linker_options_data = create_binary_from_zipped_ihex("src/modules/macho/tests/testdata/f3cde7740370819a974d1bc7fbeae1946382e3377e64f3162bcc3a5cb34828b7.in.zip");
 
     rule_true!(
         r#"
@@ -365,5 +369,183 @@ fn test_macho_module() {
     }
     "#,
         &[]
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.export_hash() == "7f3b75c82e3151fff6c0a55b51cd5b94"
+        }
+        "#,
+        &chess_macho_data
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            not defined macho.export_hash()
+    }
+    "#,
+        &[]
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.export_hash() == "6bfc6e935c71039e6e6abf097830dceb"
+        }
+        "#,
+        &tiny_universal_macho_data
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.import_hash() == "80524643c68b9cf5658e9c2ccc71bdda"
+        }
+        "#,
+        &tiny_universal_macho_data
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            not defined macho.import_hash()
+    }
+    "#,
+        &[]
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.import_hash() == "35ea3b116d319851d93e26f7392e876e"
+        }
+        "#,
+        &chess_macho_data
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.has_import("_NSEventTrackingRunLoopMode")
+        }
+        "#,
+        &chess_macho_data
+    );
+
+    rule_false!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.has_import("_NventTrackingRunLoopMode")
+        }
+        "#,
+        &chess_macho_data
+    );
+
+    rule_true!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.has_export("_factorial")
+        }
+        "#,
+        &tiny_universal_macho_data
+    );
+
+    rule_false!(
+        r#"
+        import "macho"
+        rule macho_test {
+            condition:
+                macho.has_export("__notfound_export")
+        }
+        "#,
+        &tiny_universal_macho_data
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            not defined macho.sym_hash()
+    }
+    "#,
+        &[]
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            macho.sym_hash() == "fea44765d5601027002d40c278d119aa"
+    }
+    "#,
+        &symbolt_table_test_data
+    );
+
+    rule_false!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            macho.sym_hash() == "786daad487993f71b1ba40d0f43a9e0f"
+    }
+    "#,
+        &symbolt_table_test_data
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            macho.sym_hash() == "a9ccc7c7b8bd33a99dc7ede4e8d771b4"
+    }
+    "#,
+        &tiny_universal_macho_data
+    );
+
+    rule_true!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            for any obj in macho.linker_options:
+                (obj == "-lswiftCoreFoundation")
+    }
+    "#,
+        &linker_options_data
+    );
+
+    rule_false!(
+        r#"
+    import "macho"
+    rule macho_test {
+        condition:
+            for any obj in macho.linker_options:
+                (obj == "-lswiftNotExist")
+    }
+    "#,
+        &linker_options_data
     );
 }

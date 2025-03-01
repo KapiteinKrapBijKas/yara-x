@@ -142,7 +142,8 @@ message TestProto2 {
 
   required bytes              bytes_foo = 64;
   required bytes              bytes_bar = 65;
-  optional bytes              bytes_undef = 66;
+  required bytes              bytes_raw = 66;
+  optional bytes              bytes_undef = 67;
 
   enum Enumeration {
     ITEM_0 = 0;
@@ -181,11 +182,35 @@ message TestProto2 {
   /// This field will be visible in YARA as `items` instead of `Enumeration2`.
   enum Enumeration2 {
     option (yara.enum_options).name = "items";
-    ITEM_0 = 0;
-    ITEM_1 = 1;
+    ITEM_4 = 0;
+    ITEM_5 = 1;
   }
 
   optional uint64 file_size = 400;
+
+  /// This field is accessible only if the features "foo" (or "FOO") and "bar"
+  // are enabled while compiling the YARA rules.
+  optional uint64 requires_foo_and_bar = 500 [
+    (yara.field_options) = {
+      acl: [
+        {
+          accept_if: ["foo", "FOO"],
+          error_title: "foo is required",
+          error_label: "this field was used without foo"
+        },
+        {
+          accept_if: "bar",
+          error_title: "bar is required",
+          error_label: "this field was used without bar"
+        },
+        {
+          reject_if: "baz",
+          error_title: "baz is forbidden",
+          error_label: "this field was used with baz"
+        }
+      ]
+    }
+  ];
 }
 
 enum TopLevelEnumeration {
@@ -205,7 +230,8 @@ message NestedProto2 {
   optional int32              nested_int32_one = 3;
   optional int64              nested_int64_one = 4;
   optional bool               nested_bool = 5;
-  repeated int64              nested_array_int64 = 6;
+  optional string             nested_string = 6;
+  repeated int64              nested_array_int64 = 7;
 
   enum NestedEnumeration {
     ITEM_0 = 0;

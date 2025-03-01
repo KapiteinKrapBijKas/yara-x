@@ -4,8 +4,10 @@
 .vscode
 *.profdata
 *.profraw
+*.swp
 target
 macros/target
 site/node_modules
 site/public
 site/resources
+__pycache__

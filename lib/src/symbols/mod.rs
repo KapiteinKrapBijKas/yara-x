@@ -1,22 +1,18 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::{mem, ptr};
 
 #[cfg(test)]
-use bstr::{BStr, ByteSlice};
+use bstr::BString;
 
 use crate::compiler::{RuleId, Var};
-use crate::types::{Func, TypeValue};
+use crate::types::{AclEntry, Func, Type, TypeValue, Value};
 
 /// Trait implemented by types that allow looking up for a symbol.
 pub(crate) trait SymbolLookup {
     fn lookup(&self, ident: &str) -> Option<Symbol>;
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Symbol {
-    type_value: TypeValue,
-    kind: SymbolKind,
 }
 
 /// Kinds of symbol.
@@ -24,39 +20,113 @@ pub(crate) struct Symbol {
 /// Used by the compiler to determine how to generate code that
 /// accesses the symbol.
 #[derive(Clone, Debug)]
-pub(crate) enum SymbolKind {
+pub(crate) enum Symbol {
     /// The symbol refers to a WASM-side variable.
-    Var(Var),
-    /// The symbol refers to a field in a structure. Fields in the tuple
-    /// are a `usize` containing the index the field occupies in the
-    /// structure and `bool` that is `true` if the symbol refers to a
-    /// field in the root structure. If it is `false` it refers to the
-    /// structure whose reference is at the top of the WASM stack.
-    Field(usize, bool),
+    Var { var: Var, type_value: TypeValue },
+    /// The symbol refers to a field in a structure.
+    Field {
+        /// Index the field occupies in its parent structure.
+        index: usize,
+        /// `true` if the symbol refers to a field in the root structure. If it
+        /// is `false` it refers to the structure whose reference is at the top
+        /// of the WASM stack.
+        is_root: bool,
+        /// Type and value for this field.
+        type_value: TypeValue,
+        /// Access control list (ACL) for accessing this field.
+        acl: Option<Vec<AclEntry>>,
+    },
     /// The symbol refers to a rule.
     Rule(RuleId),
     /// The symbol refers to a function.
     Func(Rc<Func>),
 }
 
+impl Hash for Symbol {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        mem::discriminant(self).hash(state);
+        match self {
+            Symbol::Var { var, .. } => {
+                var.hash(state);
+            }
+            Symbol::Field { index, is_root, .. } => {
+                index.hash(state);
+                is_root.hash(state);
+            }
+            Symbol::Rule(rule_id) => {
+                rule_id.hash(state);
+            }
+            Symbol::Func(func) => func.hash(state),
+        }
+    }
+}
+
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Symbol::Var { var: this_var, .. } => {
+                if let Symbol::Var { var: other_var, .. } = other {
+                    this_var == other_var
+                } else {
+                    false
+                }
+            }
+            Symbol::Field {
+                index: this_index, is_root: this_is_root, ..
+            } => {
+                if let Symbol::Field {
+                    index: other_index,
+                    is_root: other_is_root,
+                    ..
+                } = other
+                {
+                    this_index == other_index && this_is_root == other_is_root
+                } else {
+                    false
+                }
+            }
+            Symbol::Rule(this) => {
+                if let Symbol::Rule(other) = other {
+                    this == other
+                } else {
+                    false
+                }
+            }
+            Symbol::Func(this) => {
+                if let Symbol::Func(other) = other {
+                    ptr::eq(&**this, &**other)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl Eq for Symbol {}
+
 impl Symbol {
-    pub fn new(type_value: TypeValue, kind: SymbolKind) -> Self {
-        Self { type_value, kind }
+    pub fn ty(&self) -> Type {
+        match &self {
+            Symbol::Var { var, .. } => var.ty(),
+            Symbol::Field { type_value, .. } => type_value.ty(),
+            Symbol::Rule(_) => Type::Bool,
+            Symbol::Func(_) => Type::Func,
+        }
     }
 
-    #[inline(always)]
-    pub fn type_value(&self) -> &TypeValue {
-        &self.type_value
-    }
-
-    #[inline(always)]
-    pub fn kind(&self) -> &SymbolKind {
-        &self.kind
+    pub fn type_value(&self) -> TypeValue {
+        match &self {
+            Symbol::Var { type_value, .. } => type_value.clone(),
+            Symbol::Field { type_value, .. } => type_value.clone(),
+            Symbol::Rule(_) => TypeValue::Bool(Value::Unknown),
+            Symbol::Func(func) => TypeValue::Func(func.clone()),
+        }
     }
 
     #[cfg(test)]
     fn as_integer(&self) -> Option<i64> {
-        if let TypeValue::Integer(value) = &self.type_value {
+        if let TypeValue::Integer(value) = self.type_value() {
             value.extract().cloned()
         } else {
             None
@@ -64,13 +134,9 @@ impl Symbol {
     }
 
     #[cfg(test)]
-    fn as_bstr(&self) -> Option<&BStr> {
-        if let TypeValue::String(value) = &self.type_value {
-            if let Some(s) = value.extract() {
-                Some(s.as_bstr())
-            } else {
-                None
-            }
+    fn as_string(&self) -> Option<BString> {
+        if let TypeValue::String(value) = self.type_value() {
+            value.extract().map(|s| BString::from(s.as_slice()))
         } else {
             None
         }
@@ -80,7 +146,7 @@ impl Symbol {
 /// Implements [`SymbolLookup`] for `Option<Symbol>` so that lookup
 /// operations can be chained.
 ///
-/// For example you can do:
+/// For example, you can do:
 ///
 /// ```text
 /// symbol_table.lookup("foo").lookup("bar")
@@ -232,7 +298,7 @@ impl<'a> StackedSymbolTable<'a> {
     }
 }
 
-impl<'a> SymbolLookup for StackedSymbolTable<'a> {
+impl SymbolLookup for StackedSymbolTable<'_> {
     fn lookup(&self, ident: &str) -> Option<Symbol> {
         // Look for the identifier starting at the top of the stack, and
         // going down the stack until it's found or the bottom of the
@@ -251,7 +317,7 @@ impl<'a> SymbolLookup for StackedSymbolTable<'a> {
 #[cfg(test)]
 #[cfg(feature = "test_proto2-module")]
 mod tests {
-    use bstr::BStr;
+    use bstr::BString;
 
     use crate::symbols::SymbolLookup;
     use crate::types::{Struct, Type};
@@ -270,22 +336,12 @@ mod tests {
             true,
         );
 
-        assert_eq!(
-            test.lookup("int32_zero").unwrap().type_value.ty(),
-            Type::Integer
-        );
+        assert_eq!(test.lookup("int32_zero").unwrap().ty(), Type::Integer);
+
+        assert_eq!(test.lookup("string_foo").unwrap().ty(), Type::String);
 
         assert_eq!(
-            test.lookup("string_foo").unwrap().type_value.ty(),
-            Type::String
-        );
-
-        assert_eq!(
-            test.lookup("nested")
-                .lookup("nested_int32_zero")
-                .unwrap()
-                .type_value
-                .ty(),
+            test.lookup("nested").lookup("nested_int32_zero").unwrap().ty(),
             Type::Integer
         );
 
@@ -295,8 +351,8 @@ mod tests {
         );
 
         assert_eq!(
-            test.lookup("items").lookup("ITEM_1").unwrap().as_integer(),
-            Some(Enumeration2::ITEM_1.value() as i64)
+            test.lookup("items").lookup("ITEM_4").unwrap().as_integer(),
+            Some(Enumeration2::ITEM_4.value() as i64)
         );
     }
 
@@ -337,11 +393,12 @@ mod tests {
         test.set_float_one(1.0);
         test.set_double_one(1.0);
 
-        test.set_string_foo("foo".to_string());
-        test.set_string_bar("bar".to_string());
+        test.set_string_foo("foo".into());
+        test.set_string_bar("bar".into());
 
-        test.set_bytes_foo("foo".as_bytes().to_vec());
-        test.set_bytes_bar("bar".as_bytes().to_vec());
+        test.set_bytes_foo("foo".into());
+        test.set_bytes_bar("bar".into());
+        test.set_bytes_raw(b"\x00\x02".into());
 
         nested.set_nested_int32_zero(0);
 
@@ -369,8 +426,8 @@ mod tests {
         );
 
         assert_eq!(
-            structure.lookup("string_foo").unwrap().as_bstr(),
-            Some(BStr::new(b"foo"))
+            structure.lookup("string_foo").unwrap().as_string(),
+            Some(BString::from(b"foo"))
         );
 
         assert_eq!(

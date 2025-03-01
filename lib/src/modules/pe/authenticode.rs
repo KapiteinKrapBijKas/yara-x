@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use array_bytes::bytes2hex;
+use array_bytes::Hexify;
 use const_oid::db::{rfc5911, rfc5912, rfc6268};
 use const_oid::{AssociatedOid, ObjectIdentifier};
 use der_parser::asn1_rs::{Set, Tag, ToDer, UtcTime};
@@ -22,13 +22,16 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::der_parser::num_bigint::BigUint;
 use x509_parser::x509::{AlgorithmIdentifier, SubjectPublicKeyInfo, X509Name};
 
-use crate::modules::pe::asn1::{
+#[cfg(feature = "logging")]
+use log::error;
+
+use crate::modules::pe::authenticode::PublicKeyError::InvalidAlgorithm;
+use crate::modules::protos;
+use crate::modules::utils::asn1::{
     oid, oid_to_object_identifier, oid_to_str, Attribute, Certificate,
     ContentInfo, DigestInfo, SignedData, SignerInfo, SpcIndirectDataContent,
     SpcSpOpusInfo, TstInfo,
 };
-use crate::modules::pe::authenticode::PublicKeyError::InvalidAlgorithm;
-use crate::modules::protos;
 
 /// Error returned by [`AuthenticodeParser::parse`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,7 +256,9 @@ impl AuthenticodeParser {
                 authenticode_hasher.hash(&mut md5);
                 md5.finalize().to_vec()
             }
-            rfc5912::ID_SHA_1 | rfc5912::SHA_1_WITH_RSA_ENCRYPTION => {
+            rfc5912::ID_SHA_1
+            | rfc5912::SHA_1_WITH_RSA_ENCRYPTION
+            | oid::SHA1_WITH_RSA_ENCRYPTION_OBSOLETE => {
                 let mut sha1 = Sha1::default();
                 authenticode_hasher.hash(&mut sha1);
                 sha1.finalize().to_vec()
@@ -273,7 +278,11 @@ impl AuthenticodeParser {
                 authenticode_hasher.hash(&mut sha512);
                 sha512.finalize().to_vec()
             }
-            oid => unimplemented!("{:?}", oid),
+            _ => {
+                #[cfg(feature = "logging")]
+                error!("unknown digest algorithm: {:?}", digest_algorithm);
+                return Err(ParseError::InvalidDigestAlgorithm);
+            }
         };
 
         let authenticode_digest = indirect_data.message_digest;
@@ -300,9 +309,17 @@ impl AuthenticodeParser {
 
         let mut signatures = Vec::with_capacity(nested_signatures.len() + 1);
 
+        let (program_name, more_info) = match opus_info {
+            Some(SpcSpOpusInfo { program_name, more_info }) => {
+                (program_name, more_info)
+            }
+            None => (None, None),
+        };
+
         signatures.push(AuthenticodeSignature {
             computed_authenticode_hash,
-            program_name: opus_info.and_then(|oi| oi.program_name),
+            program_name,
+            more_info,
             authenticode_digest,
             signer_info,
             signer_info_digest,
@@ -335,7 +352,10 @@ impl AuthenticodeParser {
 
             certificates.extend(sd.certificates);
 
-            let cs_si = sd.signer_infos.first().unwrap();
+            let cs_si = match sd.signer_infos.first() {
+                Some(cs_si) => cs_si,
+                None => continue,
+            };
 
             let mut countersignature = Self::pkcs9_countersignature(cs_si)?;
 
@@ -366,7 +386,6 @@ impl AuthenticodeParser {
                     sd.content_info.content.as_bytes(),
                     cs_si_digest,
                 ) && verify_signer_info(cs_si, certificates.as_slice());
-
 
             countersignatures.push(countersignature);
         }
@@ -452,6 +471,7 @@ pub struct AuthenticodeSignature<'a> {
     certificates: Vec<Certificate<'a>>,
     countersignatures: Vec<AuthenticodeCountersign<'a>>,
     program_name: Option<String>,
+    more_info: Option<String>,
     computed_authenticode_hash: Vec<u8>,
     verified: bool,
 }
@@ -481,7 +501,7 @@ impl<'a> AuthenticodeSignature<'a> {
 
     #[inline]
     pub fn signer_info_digest(&self) -> String {
-        bytes2hex("", self.signer_info_digest.as_bytes())
+        self.signer_info_digest.hexify()
     }
 
     #[inline]
@@ -543,9 +563,9 @@ impl From<&AuthenticodeSignature<'_>> for protos::pe::Signature {
     fn from(value: &AuthenticodeSignature) -> Self {
         let mut sig = protos::pe::Signature::new();
 
-        sig.set_digest(bytes2hex("", value.stored_authenticode_hash()));
+        sig.set_digest(value.stored_authenticode_hash().hexify());
         sig.set_digest_alg(value.authenticode_hash_algorithm().into_owned());
-        sig.set_file_digest(bytes2hex("", value.computed_authenticode_hash()));
+        sig.set_file_digest(value.computed_authenticode_hash().hexify());
         sig.set_verified(value.verified());
 
         sig.certificates.extend(
@@ -581,6 +601,10 @@ impl From<&AuthenticodeSignature<'_>> for protos::pe::Signature {
             signer_info.set_program_name(program_name.clone())
         }
 
+        if let Some(more_info) = &value.more_info {
+            signer_info.set_more_info(more_info.clone())
+        }
+
         signer_info
             .chain
             .extend(value.chain().map(protos::pe::Certificate::from));
@@ -613,7 +637,7 @@ impl From<&AuthenticodeCountersign<'_>> for protos::pe::CounterSignature {
     fn from(value: &AuthenticodeCountersign<'_>) -> Self {
         let mut cs = protos::pe::CounterSignature::new();
 
-        cs.set_digest(bytes2hex("", value.digest));
+        cs.set_digest(value.digest.hexify());
         cs.set_digest_alg(value.digest_alg.to_string());
         cs.set_verified(value.verified);
         cs.sign_time = value.signing_time;
@@ -728,7 +752,9 @@ fn verify_message_digest(
         Err(_) => return false,
     };
     match oid {
-        rfc5912::ID_SHA_1 | rfc5912::SHA_1_WITH_RSA_ENCRYPTION => {
+        rfc5912::ID_SHA_1
+        | rfc5912::SHA_1_WITH_RSA_ENCRYPTION
+        | oid::SHA1_WITH_RSA_ENCRYPTION_OBSOLETE => {
             Sha1::digest(message).as_slice() == digest
         }
         rfc5912::ID_SHA_256 | rfc5912::SHA_256_WITH_RSA_ENCRYPTION => {
@@ -746,7 +772,11 @@ fn verify_message_digest(
         rfc5912::ID_MD_5 | rfc5912::MD_5_WITH_RSA_ENCRYPTION => {
             Md5::digest(message).as_slice() == digest
         }
-        _ => unimplemented!("{:?}", algorithm.oid()),
+        _ => {
+            #[cfg(feature = "logging")]
+            error!("unknown digest algorithm: {:?}", algorithm.oid());
+            false
+        }
     }
 }
 
@@ -859,7 +889,9 @@ fn verify_signer_info(si: &SignerInfo, certs: &[Certificate<'_>]) -> bool {
             attrs_set.write_der(&mut md5).unwrap();
             key.verify_digest::<Md5>(md5.finalize(), si.signature)
         }
-        rfc5912::ID_SHA_1 | rfc5912::SHA_1_WITH_RSA_ENCRYPTION => {
+        rfc5912::ID_SHA_1
+        | rfc5912::SHA_1_WITH_RSA_ENCRYPTION
+        | oid::SHA1_WITH_RSA_ENCRYPTION_OBSOLETE => {
             let mut sha1 = Sha1::default();
             attrs_set.write_der(&mut sha1).unwrap();
             key.verify_digest::<Sha1>(sha1.finalize(), si.signature)
@@ -879,8 +911,11 @@ fn verify_signer_info(si: &SignerInfo, certs: &[Certificate<'_>]) -> bool {
             attrs_set.write_der(&mut sha512).unwrap();
             key.verify_digest::<Sha512>(sha512.finalize(), si.signature)
         }
-
-        oid => unimplemented!("{:?}", oid),
+        _ => {
+            #[cfg(feature = "logging")]
+            error!("unknown digest algorithm: {:?}", digest_algorithm);
+            false
+        }
     }
 }
 
@@ -1138,7 +1173,14 @@ impl PublicKey {
             | rfc5912::ECDSA_WITH_SHA_512 => {
                 self.verify_impl::<Sha512>(message, signature)
             }
-            _ => unimplemented!("{:?}", digest_algorithm.oid()),
+            _ => {
+                #[cfg(feature = "logging")]
+                error!(
+                    "unknown digest algorithm: {:?}",
+                    digest_algorithm.oid()
+                );
+                false
+            }
         }
     }
 
